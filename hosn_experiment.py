@@ -41,6 +41,8 @@ https://mininet-wifi.github.io/advanced/  (disable automatic association)
 https://mininet-wifi.github.io/commands/ (association commands)
 https://wireless.docs.kernel.org/en/latest/en/users/documentation/iw.html
 https://man7.org/linux/man-pages/man8/tc-netem.8.html
+https://github.com/intrig-unicamp/mininet-wifi/blob/master/mn_wifi/net.py
+https://github.com/mininet/mininet/blob/master/mininet/node.py
 """
 
 import argparse
@@ -66,6 +68,7 @@ from hosn_switch import (
     ping_on_ap, restore_result_owner, wait_for_link,
 )
 
+SCRIPT_REVISION = "wired-link-lookup-v2"
 AP_PROBES = 20
 FINAL_PROBES = 5
 MAX_OBSERVATION_AGE_S = 25.0  # Guard for this static diagnostic, not a live policy.
@@ -135,11 +138,26 @@ def execute_decision(station, aps, run, decision):
                  "verified_bssid": current, "note": "No decision-time switch requested."}
 
 
-def add_test_delay(switch, link, run):
-    """Only touch the switch-side interface of a link this run just created."""
-    interface = link.intf1
-    if interface.node is not switch or not interface.name.startswith(switch.name + "-eth"):
-        raise RuntimeError("Refusing to change a non-experiment interface.")
+def add_test_delay(switch, peer, run):
+    """Find the real wired interface; do not rely on addLink's return value.
+
+    Mininet-WiFi.addLink() can create a wired link but return None. Using
+    that return value as a Link caused the earlier '.intf1' failure.
+    connectionsTo() instead looks up the created interfaces, with the local
+    switch interface first regardless of the link's creation order.
+    """
+    connections = switch.connectionsTo(peer)
+    if len(connections) != 1:
+        raise RuntimeError(
+            "Expected one wired connection from {} to {}; found {}. "
+            "No delay was applied.".format(switch.name, peer.name, len(connections)))
+    interface, remote = connections[0]
+    if (getattr(interface, "node", None) is not switch
+            or getattr(remote, "node", None) is not peer
+            or not str(getattr(interface, "name", "")).startswith(switch.name + "-eth")
+            or getattr(interface, "link", None) is None
+            or interface.link is not getattr(remote, "link", None)):
+        raise RuntimeError("Refusing to change an unverified experiment interface.")
     text, code = run(switch, ["tc", "qdisc", "replace", "dev", interface.name,
                               "root", "netem", "delay", "20ms"])
     if code:
@@ -175,6 +193,7 @@ def run_experiment(case_name):
     folder.mkdir(parents=True, exist_ok=False)
     report = {
         "case": case_name, "status": "incomplete", "created_utc": stamp,
+        "script_revision": SCRIPT_REVISION,
         "purpose": "Static engineering integration check, NOT AI evaluation/training",
         "position": setting["position"], "settings": setting,
         "backend": "default wireless backend, no wmediumd",
@@ -193,6 +212,7 @@ def run_experiment(case_name):
     old_cwd, network, exit_code = Path.cwd(), None, 1
     try:
         os.chdir(folder)
+        print("HOSN integration check: " + SCRIPT_REVISION, flush=True)
         network = Mininet_wifi(controller=None, switch=OVSBridge,
                                accessPoint=OVSBridgeAP, autoAssociation=False,
                                allAutoAssociation=False)
@@ -208,15 +228,18 @@ def run_experiment(case_name):
         network.setPropagationModel(model="logDistance", exp=3.5)
         configure = getattr(network, "configureNodes", None)
         (configure or network.configureWifiNodes)()
-        links = {node.name: network.addLink(switch, node, cls=Link)
-                 for node in (host, ap1, ap2)}
+        # Mininet-WiFi may return None even when it creates the wired link.
+        # Find its actual endpoints later through switch.connectionsTo(ap).
+        for node in (host, ap1, ap2):
+            network.addLink(switch, node, cls=Link)
         network.build()
         for bridge in (switch, ap1, ap2):
             bridge.start([])
         time.sleep(1)
 
         run = NodeCommands(folder / "setup_commands.jsonl")
-        report["delay_setup"] = add_test_delay(switch, links[setting["delayed_ap"]], run)
+        delayed_ap = next(ap for ap in aps if ap.name == setting["delayed_ap"])
+        report["delay_setup"] = add_test_delay(switch, delayed_ap, run)
         print("\nHOSN MEASURE -> RULES/CONTROLLER -> VERIFIED ACTION", flush=True)
         print("Controlled case: {}. A 20-ms delay is applied towards {}.".format(
             case_name, setting["delayed_ap"]), flush=True)
