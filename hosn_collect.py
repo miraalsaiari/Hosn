@@ -47,7 +47,7 @@ import time
 import traceback
 from typing import Any
 
-REVISION = "paired-measurements-v1"
+REVISION = "paired-measurements-v2-fixed-count"
 # This is the agreed project interface, not a new set of decision rules.
 FEATURE_ORDER = (
     "current_rssi", "candidate_rssi", "current_latency", "candidate_latency",
@@ -129,6 +129,11 @@ choice, not an agreement about the final service objective.
 ## Measurement meaning
 RTT is measured from replies; no replies means missing RTT, never zero.
 Loss is (sent-received)/sent * 100, not the configured netem loss percentage.
+Probes use a fixed transmitted count (-c) WITHOUT ping's -w deadline. Python
+separately bounds process time. The three-request warmup is not the 100-request
+feature measurement. Probe *.txt.json files explain requested/sent counts,
+actual AP checks and any rejection. A rejected probe is NOT converted to a
+completed measurement or a fictional loss rate.
 A short 100-packet window has limited precision (one packet is one percentage
 point). Keep counts and repetitions; do not report tiny loss differences as
 certain. Zero observed loss does not establish a zero true loss rate.
@@ -275,9 +280,27 @@ def make_plan(repeats=2, seed=20261002, pilot=False) -> list:
 
 
 def ping_args(interface: str, count: int, interval: float, target: str) -> tuple:
-    deadline = math.ceil((count - 1) * interval + 5.0)
+    """A fixed request count, with a separate Python process watchdog.
+
+    Do NOT combine ping -c with -w. With a deadline, iputils can continue
+    transmitting until the requested number of REPLIES arrives. A delayed
+    three-request warmup can therefore transmit five requests, and a lossy
+    100-request measurement can transmit more than 100. This breaks the fixed
+    measurement window. See iputils doc/ping.xml (-c and -w), and
+    ping/ping_common.c pinger(): the transmit-count cap applies when !deadline.
+
+    -W is retained to bound waiting when no replies arrive. It is not a
+    per-packet RTT cutoff. The outer Python timeout is a safety watchdog;
+    exceeding it invalidates a probe, never invents a completed measurement.
+    """
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("Ping count must be a positive integer.")
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+            or not math.isfinite(interval) or interval <= 0):
+        raise ValueError("Ping interval must be finite and positive.")
+    process_timeout = float(math.ceil((count - 1) * interval + 8.0))
     return (["ping", "-n", "-D", "-I", interface, "-c", str(count),
-             "-i", str(interval), "-W", "1", "-w", str(deadline), target], deadline + 3.0)
+             "-i", str(interval), "-W", "1", target], process_timeout)
 
 
 def model_snapshot(station, aps) -> dict:
@@ -355,26 +378,60 @@ def configure_paths(switch, aps, conditions: dict, run) -> list:
 
 
 def probe(station, ap, run, path: Path, count: int, interval: float, helper) -> dict:
+    """Measure a fixed-count ping window; retain diagnostics even when rejected.
+
+    Packet loss, including 100% observed loss, is valid measurement output.
+    Unexpected AP identity, incomplete sends, or invalid command output are
+    measurement-quality failures. They must not be relabelled as packet loss
+    or accepted just to make the collection pass.
+    """
     expected = str(ap.wintfs[0].mac).lower()
-    before = helper.actual_link(station, run)[0]
-    if before != expected:
-        raise RuntimeError("Wrong actual AP before measurement.")
     argv, timeout = ping_args(station.wintfs[0].name, count, interval, helper.SERVER_IP)
-    began = time.monotonic()
-    text, code = run(station, argv, timeout=timeout)
-    ended = time.monotonic()
-    path.write_text(text, encoding="utf-8")
-    if code not in (0, 1):
-        raise RuntimeError("ping did not run successfully; inspect " + path.name)
-    parsed = helper.parse_ping(text)
-    after = helper.actual_link(station, run)[0]
-    parsed.update(bssid_before=before, bssid_after=after,
-                  ap_verified=before == after == expected,
-                  requested=count, complete=parsed["sent"] == count,
-                  start_monotonic_s=began, end_monotonic_s=ended)
-    if not parsed["ap_verified"] or not parsed["complete"]:
-        raise RuntimeError("Cannot attribute a complete probe window to " + ap.name)
-    return parsed
+    diagnostic_path = path.with_name(path.name + ".json")
+    diagnostic = {"revision": REVISION, "status": "started", "raw_file": path.name,
+                  "expected_ap": ap.name, "expected_bssid": expected,
+                  "requested": count, "interval_s": interval, "argv": argv,
+                  "process_timeout_s": timeout, "fixed_transmit_count": True}
+    try:
+        before, before_text = helper.actual_link(station, run)
+        diagnostic.update(bssid_before=before, iw_before=before_text)
+        if before != expected:
+            raise RuntimeError("{}: wrong AP before probe (expected {}, observed {}).".format(
+                ap.name, expected, before or "disconnected"))
+        began = time.monotonic()
+        diagnostic["start_monotonic_s"] = began
+        text, code = run(station, argv, timeout=timeout)
+        ended = time.monotonic()
+        path.write_text(text, encoding="utf-8")
+        diagnostic.update(returncode=code, end_monotonic_s=ended)
+        if code not in (0, 1):
+            raise RuntimeError("ping command failed with code {}; inspect {}".format(code, path.name))
+        parsed = helper.parse_ping(text)
+        after, after_text = helper.actual_link(station, run)
+        parsed.update(bssid_before=before, bssid_after=after,
+                      ap_verified=before == after == expected,
+                      requested=count, complete=parsed["sent"] == count,
+                      start_monotonic_s=began, end_monotonic_s=ended)
+        diagnostic.update(parsed)
+        diagnostic["iw_after"] = after_text
+        failures = []
+        if not parsed["complete"]:
+            failures.append("requested {} requests but ping reported {} sent and {} replies".format(
+                count, parsed["sent"], parsed["received"]))
+        if not parsed["ap_verified"]:
+            failures.append("AP changed: expected {}, before {}, after {}".format(
+                expected, before or "disconnected", after or "disconnected"))
+        if failures:
+            raise RuntimeError("Probe rejected for {} ({}): {}. See {}".format(
+                ap.name, path.name, "; ".join(failures), diagnostic_path.name))
+        diagnostic["status"] = "complete"
+        return parsed
+    except BaseException as exc:
+        diagnostic.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "rejected",
+                          error=type(exc).__name__ + ": " + str(exc))
+        raise
+    finally:
+        write_json(diagnostic_path, diagnostic)
 
 
 def action_replay(station, aps, switch, setting: dict, action: str,
@@ -589,6 +646,8 @@ def collect(root: Path, options: Settings, plan: list, pilot: bool, seed: int) -
         "wireless_backend": "default hwsim, no wmediumd; no physical RSSI measurements",
         "position_updates": "model geometry only, NOT automatic association or RF-channel updates",
         "qos": "netem one-way switch egress towards each AP; settings are NOT observations",
+        "ping_mode": "fixed transmitted count (-c), no ping -w; separate Python watchdog",
+        "probe_diagnostics": "raw/*.txt.json records requested/sent counts and actual AP checks",
         "associations": "verified by Linux iw, not associatedTo alone",
         "outcomes": "ten-second nominal ping trains start before the STAY/HANDOVER action",
         "rules": "audit annotation only; not used to select/rewrite actions or training labels",
@@ -771,11 +830,147 @@ def run_self_tests() -> int:
         def test_no_model_import_for_plan(self):
             self.assertFalse(any(n.startswith("sklearn") for n in sys.modules))
 
-        def test_ping_deadline_grows_with_sample_count(self):
+        def test_ping_watchdog_grows_without_ping_deadline(self):
             a, t = ping_args("sta1-wlan0", 100, .1, "10.0.0.100")
             self.assertEqual(a[a.index("-c")+1], "100")
             self.assertGreater(t, 100 * .1)
-            self.assertGreater(int(a[a.index("-w")+1]), 6)
+            self.assertNotIn("-w", a)
+            self.assertIn("-W", a)
+            _, small_timeout = ping_args("sta1-wlan0", 3, .2, "10.0.0.100")
+            self.assertGreater(t, small_timeout)
+
+        def test_warmup_is_fixed_count_not_reply_count(self):
+            a, t = ping_args("sta1-wlan0", 3, .2, "10.0.0.100")
+            self.assertEqual(a[a.index("-c")+1], "3")
+            self.assertNotIn("-w", a)
+            self.assertEqual(a[-1], "10.0.0.100")
+            self.assertGreater(t, 5.0)
+
+        def test_count_and_interval_validation(self):
+            for count in (True, 0, -1, 3.5, "3"):
+                with self.assertRaises(ValueError):
+                    ping_args("sta1-wlan0", count, .2, "10.0.0.100")
+            for interval in (True, 0, -1, float("nan"), float("inf"), "0.2"):
+                with self.assertRaises(ValueError):
+                    ping_args("sta1-wlan0", 3, interval, "10.0.0.100")
+
+        def fixture_probe(self, directory, text, requested=3, after=None,
+                          before=None, code=0):
+            import hosn_switch as helper
+            station = SimpleNamespace(wintfs={0: SimpleNamespace(name="sta1-wlan0")})
+            bssid = "02:00:00:00:02:01"
+            ap = SimpleNamespace(name="ap2", wintfs={0: SimpleNamespace(mac=bssid)})
+            observations = [(bssid if before is None else before, "iw before"),
+                            (bssid if after is None else after, "iw after")]
+            def run(node, argv, timeout):
+                self.assertNotIn("-w", argv)
+                self.assertEqual(argv[argv.index("-c") + 1], str(requested))
+                return text, code
+            with patch.object(helper, "actual_link", side_effect=observations):
+                return probe(station, ap, run, Path(directory)/"features_ap2_warmup.txt",
+                             requested, .2, helper)
+
+        def test_delayed_three_request_warmup_is_valid(self):
+            text = ("3 packets transmitted, 3 received, 0% packet loss\n"
+                    "rtt min/avg/max/mdev = 200.0/608.73/1020.305/200.0 ms\n")
+            with tempfile.TemporaryDirectory() as d:
+                value = self.fixture_probe(d, text)
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertTrue(value["complete"])
+                self.assertTrue(value["ap_verified"])
+                self.assertEqual(meta["status"], "complete")
+                self.assertEqual(meta["rtt_avg_ms"], 608.73)
+                self.assertEqual(meta["requested"], 3)
+                self.assertNotIn("-w", meta["argv"])
+
+        def test_five_sent_for_three_requested_is_explicit(self):
+            # Regression fixture based on the reported failed warm-up summary.
+            # It is NOT measured training data and is never exported as such.
+            text = ("5 packets transmitted, 5 received, 0% packet loss, time 821ms\n"
+                    "rtt min/avg/max/mdev = 199.738/608.730/1020.305/289.773 ms, pipe 5\n")
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(RuntimeError, "requested 3 requests.*5 sent.*5 replies"):
+                    self.fixture_probe(d, text)
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertTrue(meta["ap_verified"])
+                self.assertFalse(meta["complete"])
+                self.assertEqual(meta["loss_pct"], 0.)
+                self.assertEqual(meta["status"], "rejected")
+                self.assertEqual((Path(d)/"features_ap2_warmup.txt").read_text(), text)
+
+        def test_five_sent_for_hundred_is_not_ninety_five_percent_loss(self):
+            text = ("5 packets transmitted, 5 received, 0% packet loss\n"
+                    "rtt min/avg/max/mdev = 1.0/2.0/3.0/0.1 ms\n")
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(RuntimeError, "requested 100 requests.*5 sent"):
+                    self.fixture_probe(d, text, requested=100)
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertEqual(meta["loss_pct"], 0.)
+                self.assertFalse(meta["complete"])
+
+        def test_complete_lossy_probe_remains_valid(self):
+            text = ("100 packets transmitted, 85 received, 15% packet loss\n"
+                    "rtt min/avg/max/mdev = 1.0/2.0/3.0/0.1 ms\n")
+            with tempfile.TemporaryDirectory() as d:
+                result = self.fixture_probe(d, text, requested=100)
+                self.assertTrue(result["complete"])
+                self.assertEqual(result["loss_pct"], 15.)
+                self.assertEqual(result["received"], 85)
+
+        def test_complete_total_loss_probe_keeps_unknown_rtt(self):
+            text = "100 packets transmitted, 0 received, 100% packet loss\n"
+            with tempfile.TemporaryDirectory() as d:
+                result = self.fixture_probe(d, text, requested=100, code=1)
+                self.assertTrue(result["complete"])
+                self.assertEqual(result["loss_pct"], 100.)
+                self.assertIsNone(result["rtt_avg_ms"])
+
+        def test_actual_ap_change_has_distinct_error(self):
+            text = ("3 packets transmitted, 3 received, 0% packet loss\n"
+                    "rtt min/avg/max/mdev = 1.0/2.0/3.0/0.1 ms\n")
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(RuntimeError, "AP changed"):
+                    self.fixture_probe(d, text, after="02:00:00:00:01:01")
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertTrue(meta["complete"])
+                self.assertFalse(meta["ap_verified"])
+
+        def test_disconnection_is_not_silently_accepted(self):
+            text = ("3 packets transmitted, 3 received, 0% packet loss\n"
+                    "rtt min/avg/max/mdev = 1.0/2.0/3.0/0.1 ms\n")
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(RuntimeError, "disconnected"):
+                    self.fixture_probe(d, text, after="")
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertFalse(meta["ap_verified"])
+
+        def test_wrong_start_ap_saved_without_sending_probe(self):
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(RuntimeError, "wrong AP before probe"):
+                    self.fixture_probe(d, "", before="02:00:00:00:01:01")
+                self.assertFalse((Path(d)/"features_ap2_warmup.txt").exists())
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertEqual(meta["status"], "rejected")
+                self.assertNotIn("sent", meta)
+
+        def test_command_error_saves_raw_and_diagnostics(self):
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(RuntimeError, "code 2"):
+                    self.fixture_probe(d, "ping: socket error\n", code=2)
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertEqual(meta["returncode"], 2)
+                self.assertEqual(meta["status"], "rejected")
+                self.assertNotIn("sent", meta)
+
+        def test_invalid_summary_saves_error_and_original_text(self):
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaises(ValueError):
+                    self.fixture_probe(d, "unparseable output\n")
+                meta = json.loads((Path(d)/"features_ap2_warmup.txt.json").read_text())
+                self.assertEqual(meta["status"], "rejected")
+                self.assertIn("ValueError", meta["error"])
+                self.assertEqual((Path(d)/"features_ap2_warmup.txt").read_text(),
+                                 "unparseable output\n")
 
         def test_bad_intervals_rejected(self):
             for value in (0, -1, float("nan"), float("inf"), True):
