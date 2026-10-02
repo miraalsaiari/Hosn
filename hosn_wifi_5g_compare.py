@@ -7,9 +7,11 @@ Commands:
   sudo python3 hosn_wifi_5g_compare.py --run
 
 This is validation only. It creates no training rows and no labels. Both
-strategies replay the same configured movement, access profiles, probe load,
-traffic, netem seeds, and make-before-break executor. Only the decision policy
-differs. HOSN decides from live observations; it is never switched on a timer.
+strategies replay the same configured movement, access profiles, measurement
+procedure, traffic, and make-before-break executor. When netem seeds are not
+supported, an ABBA repeat order limits ordering bias and that limitation is
+reported. Only the decision policy differs. HOSN decides from live
+observations; it is never switched on a timer.
 
 The second access is an IP-path emulator shaped to an explicitly documented
 healthy conversational-video service profile. It is not a 3GPP radio/core.
@@ -38,7 +40,7 @@ from typing import Any, Optional
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "wifi-5g-mbb-controlled-comparison-v1"
+REVISION = "wifi-5g-mbb-controlled-comparison-v2"
 TRAFFIC_DURATION_S = 16.0
 PACKETS_PER_SECOND = 100.0
 PAYLOAD_BYTES = 1200
@@ -68,17 +70,26 @@ MOVEMENT = [
     {"at_s": 8.0, "x_m": 65.0, "wifi_profile": "wifi_edge"},
 ]
 
+REPLAY_PLAN = [
+    {"id": "baseline_1", "strategy": "conventional_rssi"},
+    {"id": "hosn_1", "strategy": "hosn_rules_first"},
+    {"id": "hosn_2", "strategy": "hosn_rules_first"},
+    {"id": "baseline_2", "strategy": "conventional_rssi"},
+]
+
 PLAN = {
     "revision": REVISION,
     "purpose": "small controlled pre-dataset comparison",
     "dataset_collection": False,
     "synthetic_result_rows": False,
     "strategies": ["conventional_rssi", "hosn_rules_first"],
-    "run_order": ["conventional_rssi", "hosn_rules_first"],
+    "run_order": REPLAY_PLAN,
     "controlled_conditions": {
         "same_movement": MOVEMENT,
         "same_access_profiles": ACCESS_PROFILES,
-        "same_netem_seed_per_profile": True,
+        "same_impairment_distributions": True,
+        "netem_seed": "used when supported; otherwise explicitly unseeded",
+        "unseeded_fairness_control": "ABBA repeated-replay order",
         "same_probe_procedure_until_each_policy_decides": True,
         "same_media_workload": True,
         "same_make_before_break_executor": True,
@@ -207,27 +218,48 @@ def percentile(values: list[float], q: float) -> Optional[float]:
     return ordered[lo] if lo == hi else ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
 
 
-def profile_tc_args(interface: str, profile: dict, seed: int) -> list[str]:
+def profile_tc_args(interface: str, profile: dict, seed: Optional[int]) -> list[str]:
     for key in ("delay_ms", "jitter_ms", "loss_pct", "rate_mbit"):
         value = profile.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError("Invalid profile value: " + key)
-    if profile["rate_mbit"] <= 0 or profile["loss_pct"] > 100 or not isinstance(seed, int) or seed <= 0:
-        raise ValueError("Invalid profile range or seed")
-    return ["tc","qdisc","replace","dev",interface,"root","netem",
+    if profile["rate_mbit"] <= 0 or profile["loss_pct"] > 100:
+        raise ValueError("Invalid profile range")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or seed <= 0):
+        raise ValueError("Invalid netem seed")
+    args = ["tc","qdisc","replace","dev",interface,"root","netem",
             "delay",f'{profile["delay_ms"]}ms',f'{profile["jitter_ms"]}ms',"distribution","normal",
-            "loss","random",f'{profile["loss_pct"]}%',"rate",f'{profile["rate_mbit"]}mbit',"seed",str(seed)]
+            "loss","random",f'{profile["loss_pct"]}%',"rate",f'{profile["rate_mbit"]}mbit']
+    if seed is not None:
+        args.extend(["seed", str(seed)])
+    return args
 
 
-def configure_profile(node, interface: str, name: str, seed: int, run) -> dict:
-    argv = profile_tc_args(interface, ACCESS_PROFILES[name], seed)
+def configure_profile(node, interface: str, name: str, seed: int,
+                      seed_supported: bool, run) -> dict:
+    applied_seed = seed if seed_supported else None
+    argv = profile_tc_args(interface, ACCESS_PROFILES[name], applied_seed)
     text, code = run(node, argv)
     if code:
-        raise RuntimeError("tc/netem profile failed (iproute2 must support 'seed'): " + text.strip())
+        raise RuntimeError("tc/netem profile failed: " + text.strip())
     shown, code = run(node, ["tc", "qdisc", "show", "dev", interface])
     if code or "netem" not in shown:
         raise RuntimeError("Could not verify netem on " + interface)
-    return {"name": name, "configured_not_measured": ACCESS_PROFILES[name], "seed": seed, "tc_show": shown.strip()}
+    return {"name": name, "configured_not_measured": ACCESS_PROFILES[name],
+            "requested_seed": seed, "applied_seed": applied_seed,
+            "randomization": "seeded" if seed_supported else "unseeded_by_platform_limitation",
+            "tc_show": shown.strip()}
+
+
+def detect_netem_seed_support(node, interface: str, run) -> dict:
+    text, code = run(node, ["tc", "qdisc", "replace", "dev", interface,
+                            "root", "netem", "help"])
+    # `netem help` intentionally exits non-zero on common iproute2 versions.
+    # Capability is established from the parser's own usage text.
+    supported = "seed" in text.lower()
+    return {"supported": supported, "help_returncode": code,
+            "detection": "netem_help_usage_contains_seed" if supported
+                         else "netem_help_usage_omits_seed"}
 
 
 def heterogeneous_hosn_decision(wifi_rssi: float, wifi_probe: dict, cell_probe: dict) -> dict:
@@ -357,11 +389,12 @@ def disconnect_wifi(station, ap, run, helper) -> None:
     helper.wait_for_link(station,"",run,timeout=4.0); helper.sync_observed_record(station,(ap,),"")
 
 
-def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core, cell_gateway, ap, run, helper) -> dict:
+def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core,
+               cell_gateway, ap, seed_supported: bool, run, helper) -> dict:
     wifi_if=station.wintfs[0].name
     station.position=[20.0,40.0,0.0]
     helper.connect_verified(station,ap,(ap,),run)
-    profile_log={"cell":configure_profile(station,"sta1-5g0","emulated_5g_healthy",9001,run)}
+    profile_log={"cell":configure_profile(station,"sta1-5g0","emulated_5g_healthy",9001,seed_supported,run)}
     decision_log=[]; movement_log=[]; handover_stage_index=None
     seed_map={"wifi_near":1001,"wifi_moving":1002,"wifi_edge":1003}
     sender_script=replay_dir/"sender.py"; receiver_script=replay_dir/"receiver.py"
@@ -378,11 +411,12 @@ def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core, cell
         for stage_index,stage in enumerate(MOVEMENT):
             base.sleep_until(start+stage["at_s"])
             station.position=[stage["x_m"],40.0,0.0]
-            profile_log[stage["wifi_profile"]]=configure_profile(station,wifi_if,stage["wifi_profile"],seed_map[stage["wifi_profile"]],run)
+            profile_log[stage["wifi_profile"]]=configure_profile(station,wifi_if,stage["wifi_profile"],seed_map[stage["wifi_profile"]],seed_supported,run)
             movement_log.append({"scheduled_at_s":stage["at_s"],"applied_at_s":time.monotonic()-start,
                                  "x_m":stage["x_m"],"wifi_profile":stage["wifi_profile"],
                                  "wifi_rssi_model_dbm":base.modeled_wifi_rssi(station,ap)})
-            # Identical probes in both strategies; baseline records but ignores QoS.
+            # Same probe procedure while each policy is active; baseline records
+            # the results but ignores QoS when deciding.
             wifi_probe=base.ping_path(station,wifi_if,base.WIFI_SERVER_IP,run,replay_dir/(stage["wifi_profile"]+"_wifi_ping.txt"),helper,count=PROBE_COUNT)
             cell_probe=base.ping_path(station,"sta1-5g0",base.CELL_SERVER_IP,run,replay_dir/(stage["wifi_profile"]+"_cell_ping.txt"),helper,count=PROBE_COUNT)
             for _ in range(RSSI_CONFIRMATIONS):
@@ -405,7 +439,7 @@ def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core, cell
         for stage in MOVEMENT[(handover_stage_index or 0)+1:]:
             base.sleep_until(start+stage["at_s"])
             station.position=[stage["x_m"],40.0,0.0]
-            profile_log[stage["wifi_profile"]]=configure_profile(station,wifi_if,stage["wifi_profile"],seed_map[stage["wifi_profile"]],run)
+            profile_log[stage["wifi_profile"]]=configure_profile(station,wifi_if,stage["wifi_profile"],seed_map[stage["wifi_profile"]],seed_supported,run)
             movement_log.append({"scheduled_at_s":stage["at_s"],"applied_at_s":time.monotonic()-start,
                                  "x_m":stage["x_m"],"wifi_profile":stage["wifi_profile"],
                                  "wifi_rssi_model_dbm":base.modeled_wifi_rssi(station,ap),
@@ -415,13 +449,46 @@ def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core, cell
         timing={"decision_ns":decision_ns,"duplicate_start_ns":duplicate_ns,"candidate_verified_ns":candidate_ns,"wifi_break_ns":break_ns,
                 "wifi_disconnected_verified":helper.actual_link(station,run)[0]=="","decision_source":handover["source"]}
         summary=summarize(json.loads(send_summary.read_text()),json.loads(recv_summary.read_text()),read_events(packets),timing)
-        summary.update(strategy=strategy,decision=handover,decision_log=decision_log,timing=timing,profiles=profile_log,movement=movement_log)
+        summary.update(strategy=strategy,decision=handover,decision_log=decision_log,
+                       timing=timing,profiles=profile_log,movement=movement_log,
+                       netem_seed_supported=seed_supported)
         write_json(replay_dir/"summary.json",summary); return summary
     finally:
         for proc in (sender,receiver):
             if proc is not None and proc.poll() is None: proc.kill(); proc.wait(timeout=3)
         for handle in (send_out,recv_out):
             if handle is not None: handle.close()
+
+
+def aggregate_results(results: dict[str, dict]) -> dict:
+    grouped = {"conventional_rssi": [], "hosn_rules_first": []}
+    for result in results.values():
+        grouped[result["strategy"]].append(result)
+    output = {}
+    for strategy, items in grouped.items():
+        if not items:
+            continue
+        output[strategy] = {
+            "replays": len(items),
+            "mean_actual_loss_pct": statistics.fmean(x["actual_loss_pct"] for x in items),
+            "mean_p95_one_way_process_delay_ms": statistics.fmean(
+                x["one_way_process_delay_ms"]["p95"] for x in items
+            ),
+            "mean_rfc3550_interarrival_jitter_ms": statistics.fmean(
+                x["rfc3550_interarrival_jitter_ms"] for x in items
+            ),
+            "mean_handover_window_max_interarrival_gap_ms": statistics.fmean(
+                x["handover_window_max_interarrival_gap_ms"] for x in items
+            ),
+            "mean_application_goodput_mbps": statistics.fmean(
+                x["application_goodput_mbps"] for x in items
+            ),
+            "mean_complete_frames_pct": statistics.fmean(
+                x["frames"]["complete_pct"] for x in items
+            ),
+            "all_mechanical_checks_pass": all(x["pilot_valid"] for x in items),
+        }
+    return output
 
 
 def run_comparison(root: Path) -> int:
@@ -442,15 +509,21 @@ def run_comparison(root: Path) -> int:
         base.verified_interface(station,cell_gateway,"sta1-5g0"); base.verified_interface(server,wifi_core,"h1-wifi0"); base.verified_interface(server,cell_gateway,"h1-5g0")
         base.configure_ip(station,wifi_if,base.WIFI_UE_IP+"/24",run); base.configure_ip(station,"sta1-5g0",base.CELL_UE_IP+"/24",run)
         base.configure_ip(server,"h1-wifi0",base.WIFI_SERVER_IP+"/24",run); base.configure_ip(server,"h1-5g0",base.CELL_SERVER_IP+"/24",run)
+        seed_capability=detect_netem_seed_support(station,"sta1-5g0",run)
+        manifest["netem_seed_capability"]=seed_capability
+        print("netem seeded loss:","supported" if seed_capability["supported"] else "not supported; using ABBA repeats",flush=True)
         results={}
-        for strategy in PLAN["run_order"]:
-            replay=folder/strategy; replay.mkdir(); print("\nRunning",strategy,"replay...",flush=True)
-            results[strategy]=run_replay(strategy,replay,station,server,wifi_core,cell_gateway,ap,run,helper)
-            s=results[strategy]; print("  loss={:.3f}% gap={:.3f}ms goodput={:.3f}Mbps decision={}".format(s["actual_loss_pct"],s["handover_window_max_interarrival_gap_ms"],s["application_goodput_mbps"],s["decision"]["source"]),flush=True)
+        for replay_spec in REPLAY_PLAN:
+            replay_id=replay_spec["id"]; strategy=replay_spec["strategy"]
+            replay=folder/replay_id; replay.mkdir(); print("\nRunning",replay_id,"("+strategy+")...",flush=True)
+            results[replay_id]=run_replay(strategy,replay,station,server,wifi_core,cell_gateway,ap,seed_capability["supported"],run,helper)
+            s=results[replay_id]; print("  loss={:.3f}% gap={:.3f}ms goodput={:.3f}Mbps decision={}".format(s["actual_loss_pct"],s["handover_window_max_interarrival_gap_ms"],s["application_goodput_mbps"],s["decision"]["source"]),flush=True)
         all_valid=all(item["pilot_valid"] for item in results.values())
         comparison={"revision":REVISION,"controlled_pilot_only":True,"final_dataset_started":False,
-                    "mechanical_checks_pass":all_valid,"results":results,
-                    "honesty_note":"Independent real packet replays under identical configured conditions; results may differ because packet scheduling is stochastic despite fixed netem seeds.",
+                    "mechanical_checks_pass":all_valid,"netem_seed_capability":seed_capability,
+                    "replay_order":REPLAY_PLAN,"results":results,
+                    "aggregate_by_strategy":aggregate_results(results),
+                    "honesty_note":"Real packet replays use identical configured movement and impairment distributions. If this iproute2 lacks netem seed support, exact random drop events differ; ABBA repeats reduce ordering bias and the limitation is retained in the results.",
                     "winner_not_forced":True}
         write_json(folder/"comparison.json",comparison); manifest["status"]="pilot_complete" if all_valid else "pilot_checks_failed"; manifest["comparison_file"]="comparison.json"; write_json(folder/"manifest.json",manifest)
         print("\nCONTROLLED PILOT {} — final dataset NOT started.".format("COMPLETE" if all_valid else "CHECKS FAILED"))
@@ -473,8 +546,15 @@ def run_self_tests() -> int:
         def test_no_dataset(self): self.assertFalse(PLAN["dataset_collection"]); self.assertFalse(PLAN["synthetic_result_rows"])
         def test_cell_profile_is_explicit(self):
             p=ACCESS_PROFILES["emulated_5g_healthy"]; self.assertEqual(set(p),{"delay_ms","jitter_ms","loss_pct","rate_mbit"}); self.assertEqual(p["loss_pct"],.1)
-        def test_seeded_netem(self):
-            args=profile_tc_args("x0",ACCESS_PROFILES["wifi_edge"],123); self.assertIn("seed",args); self.assertIn("normal",args)
+        def test_seeded_and_legacy_netem(self):
+            seeded=profile_tc_args("x0",ACCESS_PROFILES["wifi_edge"],123)
+            legacy=profile_tc_args("x0",ACCESS_PROFILES["wifi_edge"],None)
+            self.assertIn("seed",seeded); self.assertNotIn("seed",legacy)
+            self.assertIn("normal",seeded); self.assertIn("normal",legacy)
+        def test_abba_replay_order(self):
+            self.assertEqual([x["strategy"] for x in REPLAY_PLAN],
+                             ["conventional_rssi","hosn_rules_first",
+                              "hosn_rules_first","conventional_rssi"])
         def test_baseline_confirmation(self):
             d,n=baseline_decision(-76,0); self.assertEqual(d["action"],"STAY"); d,n=baseline_decision(-76,n); self.assertEqual(d["action"],"HANDOVER")
         def test_hosn_clear_and_conflict(self):
