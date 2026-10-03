@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Controlled RSSI-baseline vs HOSN Wi-Fi -> emulated-5G pilot.
+"""Controlled Wi-Fi -> emulated-5G HOSN comparison harness.
 
 Commands:
   python3 hosn_wifi_5g_compare.py --self-test
   python3 hosn_wifi_5g_compare.py --plan
   sudo python3 hosn_wifi_5g_compare.py --run
 
-This is validation only. It creates no training rows and no labels. Both
+This is validation only. It creates no training rows and no labels. Active
 strategies replay the same configured movement, access profiles, measurement
 procedure, traffic, and make-before-break executor. When netem seeds are not
 supported, an ABBA repeat order limits ordering bias and that limitation is
@@ -38,9 +38,11 @@ import traceback
 from typing import Any, Optional
 
 import hosn_wifi_5g_pilot as base
+import hosn_heterogeneous_controller as heterogeneous
+import hosn_strategy_router as strategy_router
 
 
-REVISION = "wifi-5g-mbb-controlled-comparison-v2"
+REVISION = "wifi-5g-mbb-controlled-comparison-v3-router-integrated"
 TRAFFIC_DURATION_S = 16.0
 PACKETS_PER_SECOND = 100.0
 PAYLOAD_BYTES = 1200
@@ -71,10 +73,10 @@ MOVEMENT = [
 ]
 
 REPLAY_PLAN = [
-    {"id": "baseline_1", "strategy": "conventional_rssi"},
-    {"id": "hosn_1", "strategy": "hosn_rules_first"},
-    {"id": "hosn_2", "strategy": "hosn_rules_first"},
-    {"id": "baseline_2", "strategy": "conventional_rssi"},
+    {"id": "baseline_1", "strategy": strategy_router.RSSI_BASELINE},
+    {"id": "hosn_rules_1", "strategy": strategy_router.HOSN_RULES_ONLY},
+    {"id": "hosn_rules_2", "strategy": strategy_router.HOSN_RULES_ONLY},
+    {"id": "baseline_2", "strategy": strategy_router.RSSI_BASELINE},
 ]
 
 PLAN = {
@@ -82,7 +84,12 @@ PLAN = {
     "purpose": "small controlled pre-dataset comparison",
     "dataset_collection": False,
     "synthetic_result_rows": False,
-    "strategies": ["conventional_rssi", "hosn_rules_first"],
+    "architecture_strategies": list(strategy_router.STRATEGIES),
+    "active_network_pilot_strategies": [
+        strategy_router.RSSI_BASELINE,
+        strategy_router.HOSN_RULES_ONLY,
+    ],
+    "blocked_until_measured_model_exists": strategy_router.HOSN_FULL_AI,
     "run_order": REPLAY_PLAN,
     "controlled_conditions": {
         "same_movement": MOVEMENT,
@@ -118,6 +125,14 @@ PLAN = {
         "emulated_cellular_service_floor_rsrp_dbm": -105.0,
         "emulated_cellular_rsrp_dbm": -90.0,
         "signal_margin_advantage_db": SIGNAL_MARGIN_ADVANTAGE_DB,
+    },
+    "full_ai_policy": {
+        "status": "not_active",
+        "reason": "No reviewed model trained from measured heterogeneous experiments exists yet.",
+        "conflict_behavior": "safe HOLD",
+        "required_training_origin": heterogeneous.REQUIRED_TRAINING_DATA_KIND,
+        "required_schema": heterogeneous.MODEL_SCHEMA_VERSION,
+        "required_feature_order": list(heterogeneous.AI_FEATURE_ORDER),
     },
     "make_before_break": {
         "candidate_preconfigured_and_probed": True,
@@ -262,33 +277,51 @@ def detect_netem_seed_support(node, interface: str, run) -> dict:
                          else "netem_help_usage_omits_seed"}
 
 
-def heterogeneous_hosn_decision(wifi_rssi: float, wifi_probe: dict, cell_probe: dict) -> dict:
-    wifi_margin = wifi_rssi - PLAN["hosn_policy"]["wifi_service_floor_dbm"]
-    cell_rsrp = PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"]
-    cell_margin = cell_rsrp - PLAN["hosn_policy"]["emulated_cellular_service_floor_rsrp_dbm"]
-    evidence = {"wifi_rssi_model_dbm": wifi_rssi, "cell_rsrp_configured_dbm": cell_rsrp,
-                "wifi_link_margin_db": wifi_margin, "cell_link_margin_db": cell_margin,
-                "wifi_probe": wifi_probe, "cell_probe": cell_probe}
+def route_live_decision(strategy: str, wifi_rssi: float, wifi_probe: dict,
+                        cell_probe: dict, baseline_state=None, ai_model=None) -> dict:
+    """Adapt measured replay observations to the audited strategy router."""
+    current = heterogeneous.AccessObservation(
+        access_name="wifi",
+        technology="wifi_rssi",
+        signal_dbm=wifi_rssi,
+        service_floor_dbm=PLAN["hosn_policy"]["wifi_service_floor_dbm"],
+        latency_ms=wifi_probe["rtt_avg_ms"],
+        loss_pct=wifi_probe["loss_pct"],
+        trend_db_per_s=None,
+    )
+    candidate = heterogeneous.AccessObservation(
+        access_name="emulated_5g",
+        technology="cellular_rsrp",
+        signal_dbm=PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"],
+        service_floor_dbm=PLAN["hosn_policy"]["emulated_cellular_service_floor_rsrp_dbm"],
+        latency_ms=cell_probe["rtt_avg_ms"],
+        loss_pct=cell_probe["loss_pct"],
+        trend_db_per_s=None,
+    )
     if cell_probe["received"] == 0:
-        return {"action":"STAY","source":"SAFETY","reason":"candidate_unreachable","evidence":evidence}
-    wl, cl = wifi_probe["loss_pct"], cell_probe["loss_pct"]
-    wr, cr = wifi_probe["rtt_avg_ms"], cell_probe["rtt_avg_ms"]
-    candidate_signal_better = cell_margin >= wifi_margin + SIGNAL_MARGIN_ADVANTAGE_DB
-    candidate_qos_no_worse = (wr is None or cr <= wr) and cl <= wl
-    if candidate_signal_better and candidate_qos_no_worse:
-        return {"action":"HANDOVER","source":"RULES","reason":"candidate_margin_and_qos_clear","evidence":evidence}
-    current_has_no_signal_disadvantage = wifi_margin + SIGNAL_MARGIN_ADVANTAGE_DB > cell_margin
-    current_qos_no_worse = (cr is None or (wr is not None and wr <= cr)) and wl <= cl
-    if current_has_no_signal_disadvantage and current_qos_no_worse:
-        return {"action":"STAY","source":"RULES","reason":"current_access_clear","evidence":evidence}
-    return {"action":"STAY","source":"AI_UNAVAILABLE_HOLD","reason":"rules_conflict_no_reviewed_ai","evidence":evidence}
-
-
-def baseline_decision(rssi: float, consecutive: int) -> tuple[dict, int]:
-    consecutive = consecutive + 1 if rssi <= RSSI_BASELINE_THRESHOLD_DBM else 0
-    action = "HANDOVER" if consecutive >= RSSI_CONFIRMATIONS else "STAY"
-    return ({"action":action,"source":"RSSI_BASELINE","reason":"threshold_confirmed" if action == "HANDOVER" else "threshold_not_confirmed",
-             "evidence":{"wifi_rssi_model_dbm":rssi,"threshold_dbm":RSSI_BASELINE_THRESHOLD_DBM,"consecutive":consecutive}}, consecutive)
+        return {
+            "action": "STAY", "source": "SAFETY",
+            "reason": "candidate_unreachable", "ai_called": False,
+            "handover_authorized": False,
+        }
+    routed = strategy_router.route_decision(
+        strategy, current, candidate,
+        baseline_state=baseline_state,
+        ai_model=ai_model,
+        config=heterogeneous.RuleConfig(
+            signal_margin_advantage_db=SIGNAL_MARGIN_ADVANTAGE_DB
+        ),
+    )
+    value = routed.to_dict()
+    return {
+        "action": value["decision"],
+        "source": value["source"],
+        "reason": value["reason"],
+        "status": value["status"],
+        "ai_called": value["ai_called"],
+        "handover_authorized": value["handover_authorized"],
+        "controller_result": value["controller_result"],
+    }
 
 
 def rfc3550_jitter_ms(events: list[dict]) -> Optional[float]:
@@ -339,7 +372,7 @@ def summarize(sender: dict, receiver: dict, events: list[dict], timing: dict) ->
               "minimum_overlap_met":(break_ns-timing["duplicate_start_ns"])/1e9 >= OVERLAP_MIN_S,
               "wifi_actually_disconnected":timing["wifi_disconnected_verified"],
               "no_parse_errors":receiver["parse_errors"]==0,
-              "handover_was_policy_decision":timing["decision_source"] in ("RSSI_BASELINE","RULES")}
+              "handover_was_policy_decision":timing["decision_source"] in (strategy_router.RSSI_BASELINE,"RULES","AI")}
     return {"attempted_packets":attempted,"successful_datagrams_sent":sender["successful_datagrams"],
             "raw_datagrams_received":len(ordered),"unique_packets_received":received,
             "duplicate_datagrams_received":len(ordered)-received,"actual_lost_sequences":loss_packets,
@@ -407,7 +440,14 @@ def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core,
         start=time.monotonic()+1.5; stop=start+TRAFFIC_DURATION_S
         receiver=server.popen([sys.executable,str(receiver_script),str(base.UDP_PORT),str(stop+1),str(packets),str(recv_summary)],stdout=recv_out,stderr=subprocess.STDOUT)
         sender=station.popen([sys.executable,str(sender_script),base.WIFI_UE_IP,wifi_if,base.WIFI_SERVER_IP,base.CELL_UE_IP,"sta1-5g0",base.CELL_SERVER_IP,str(base.UDP_PORT),str(start),str(stop),str(1/PACKETS_PER_SECOND),str(PAYLOAD_BYTES),str(control),str(send_summary)],stdout=send_out,stderr=subprocess.STDOUT)
-        handover=None; confirmations=0
+        handover=None
+        baseline_state = (
+            strategy_router.BaselineState(
+                threshold_dbm=RSSI_BASELINE_THRESHOLD_DBM,
+                required_confirmations=RSSI_CONFIRMATIONS,
+            )
+            if strategy == strategy_router.RSSI_BASELINE else None
+        )
         for stage_index,stage in enumerate(MOVEMENT):
             base.sleep_until(start+stage["at_s"])
             station.position=[stage["x_m"],40.0,0.0]
@@ -421,10 +461,13 @@ def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core,
             cell_probe=base.ping_path(station,"sta1-5g0",base.CELL_SERVER_IP,run,replay_dir/(stage["wifi_profile"]+"_cell_ping.txt"),helper,count=PROBE_COUNT)
             for _ in range(RSSI_CONFIRMATIONS):
                 rssi=base.modeled_wifi_rssi(station,ap)
-                if strategy=="conventional_rssi": decision,confirmations=baseline_decision(rssi,confirmations)
-                else: decision=heterogeneous_hosn_decision(rssi,wifi_probe,cell_probe)
+                decision=route_live_decision(
+                    strategy, rssi, wifi_probe, cell_probe,
+                    baseline_state=baseline_state,
+                )
                 decision.update(elapsed_s=time.monotonic()-start,stage=stage["wifi_profile"]); decision_log.append(decision)
-                if decision["action"]=="HANDOVER": handover=decision; handover_stage_index=stage_index; break
+                if decision["action"]=="HANDOVER" and decision["handover_authorized"]:
+                    handover=decision; handover_stage_index=stage_index; break
                 time.sleep(CONTROLLER_PERIOD_S)
             if handover: break
         if not handover: raise RuntimeError(strategy+" never decided to hand over")
@@ -461,7 +504,11 @@ def run_replay(strategy: str, replay_dir: Path, station, server, wifi_core,
 
 
 def aggregate_results(results: dict[str, dict]) -> dict:
-    grouped = {"conventional_rssi": [], "hosn_rules_first": []}
+    grouped = {
+        strategy_router.RSSI_BASELINE: [],
+        strategy_router.HOSN_RULES_ONLY: [],
+        strategy_router.HOSN_FULL_AI: [],
+    }
     for result in results.values():
         grouped[result["strategy"]].append(result)
     output = {}
@@ -500,7 +547,7 @@ def run_comparison(root: Path) -> int:
     manifest={"revision":REVISION,"status":"starting","created_utc":stamp,"data_kind":"controlled_pilot_not_training_data","labels_assigned":0,"model_loaded":False,
               "real_3gpp_stack":False,"python":platform.python_version(),"kernel":platform.release(),"machine":platform.machine(),
               "mininet_wifi_version":str(getattr(wifi_module,"VERSION","unknown")),
-              "source_sha256":{name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ("hosn_wifi_5g_compare.py","hosn_wifi_5g_pilot.py","hosn_switch.py")}}
+              "source_sha256":{name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ("hosn_wifi_5g_compare.py","hosn_wifi_5g_pilot.py","hosn_switch.py","hosn_heterogeneous_controller.py","hosn_strategy_router.py")}}
     write_json(folder/"manifest.json",manifest)
     network=None; old=Path.cwd()
     try:
@@ -553,14 +600,24 @@ def run_self_tests() -> int:
             self.assertIn("normal",seeded); self.assertIn("normal",legacy)
         def test_abba_replay_order(self):
             self.assertEqual([x["strategy"] for x in REPLAY_PLAN],
-                             ["conventional_rssi","hosn_rules_first",
-                              "hosn_rules_first","conventional_rssi"])
-        def test_baseline_confirmation(self):
-            d,n=baseline_decision(-76,0); self.assertEqual(d["action"],"STAY"); d,n=baseline_decision(-76,n); self.assertEqual(d["action"],"HANDOVER")
-        def test_hosn_clear_and_conflict(self):
-            wp={"sent":20,"received":16,"loss_pct":20.0,"rtt_avg_ms":80.0}; cp={"sent":20,"received":20,"loss_pct":0.0,"rtt_avg_ms":30.0}
-            self.assertEqual(heterogeneous_hosn_decision(-86,wp,cp)["source"],"RULES")
-            wp.update(received=20,loss_pct=0.0,rtt_avg_ms=20.0); self.assertEqual(heterogeneous_hosn_decision(-75,wp,cp)["source"],"AI_UNAVAILABLE_HOLD")
+                             [strategy_router.RSSI_BASELINE,
+                              strategy_router.HOSN_RULES_ONLY,
+                              strategy_router.HOSN_RULES_ONLY,
+                              strategy_router.RSSI_BASELINE])
+        def test_router_integration_keeps_strategies_separate(self):
+            wp={"sent":20,"received":20,"loss_pct":0.0,"rtt_avg_ms":20.0}
+            cp={"sent":20,"received":20,"loss_pct":0.0,"rtt_avg_ms":30.0}
+            state=strategy_router.BaselineState(threshold_dbm=-75.0,required_confirmations=2)
+            first=route_live_decision(strategy_router.RSSI_BASELINE,-76,wp,cp,baseline_state=state)
+            second=route_live_decision(strategy_router.RSSI_BASELINE,-76,wp,cp,baseline_state=state)
+            self.assertEqual(first["action"],"STAY")
+            self.assertEqual((second["action"],second["source"]),("HANDOVER",strategy_router.RSSI_BASELINE))
+            rules=route_live_decision(strategy_router.HOSN_RULES_ONLY,-86,wp,{**cp,"rtt_avg_ms":15.0})
+            self.assertEqual((rules["action"],rules["source"]),("HANDOVER","RULES"))
+        def test_full_ai_is_declared_but_not_in_network_plan(self):
+            self.assertIn(strategy_router.HOSN_FULL_AI,PLAN["architecture_strategies"])
+            self.assertNotIn(strategy_router.HOSN_FULL_AI,[x["strategy"] for x in REPLAY_PLAN])
+            self.assertEqual(PLAN["blocked_until_measured_model_exists"],strategy_router.HOSN_FULL_AI)
         def test_summary_counts_duplicates_and_loss(self):
             sender={"status":"complete","scheduled_sequences":8,"successful_datagrams":10}; receiver={"status":"complete","parse_errors":0}
             ev=[]
@@ -587,7 +644,7 @@ def main() -> int:
     missing=[x for x in ("ip","iw","ping","tc") if not shutil.which(x)]
     if missing: parser.exit(2,"Missing required tools: "+", ".join(missing)+"\n")
     root=Path(__file__).resolve().parent
-    needed=("hosn_switch.py","hosn_wifi_5g_pilot.py")
+    needed=("hosn_switch.py","hosn_wifi_5g_pilot.py","hosn_heterogeneous_controller.py","hosn_strategy_router.py")
     if any(not (root/x).is_file() for x in needed): parser.exit(2,"Keep this file beside "+" and ".join(needed)+".\n")
     return run_comparison(root)
 
