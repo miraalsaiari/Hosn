@@ -471,7 +471,8 @@ def pairing_diagnostics(results: dict[str, dict]) -> dict:
 
 
 def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
-            cell_gateway, ap, seed_supported: bool, run, helper) -> dict:
+            cell_gateway, ap, seed_supported: bool, run, helper,
+            decision_callback=None) -> dict:
     wifi_if = station.wintfs[0].name
     movement = scenario["movement"]
     decision_stage_index = int(scenario["decision_stage_index"])
@@ -525,6 +526,10 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
 
         decision_ns = None
         snapshot = None
+        controller_decision = {
+            "mode": "forced_paired_experiment", "action": action,
+            "source": "EXPERIMENT",
+        }
         timing = {
             "duplicate_start_ns": None,
             "candidate_verified_ns": None,
@@ -586,6 +591,14 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                 },
             }
             snapshot["rule_evaluation"] = evaluate_snapshot_rules(snapshot)
+            if decision_callback is not None:
+                controller_decision = decision_callback(snapshot)
+                if not isinstance(controller_decision, dict):
+                    raise TypeError("decision_callback must return a dictionary")
+                selected = controller_decision.get("action")
+                if selected not in (STAY, HANDOVER):
+                    raise ValueError("decision_callback action must be STAY or HANDOVER")
+                action = selected
             if action == HANDOVER:
                 control.write_text("duplicate\n", encoding="utf-8")
                 duplicate_ns = time.monotonic_ns()
@@ -620,6 +633,7 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             scenario_id=scenario["id"],
             scenario_design_role=scenario["design_role"],
             decision_snapshot=snapshot,
+            controller_decision=controller_decision,
             timing=timing,
             movement=movement_log,
             profiles=profile_log,
@@ -940,6 +954,10 @@ def run_self_tests() -> int:
 
         def test_campaign_seed_offsets_must_be_nonnegative(self):
             self.assertTrue(all(item.get("seed_offset", 0) >= 0 for item in MATRIX_SCENARIOS))
+
+        def test_run_one_supports_live_decision_callback(self):
+            import inspect
+            self.assertIn("decision_callback", inspect.signature(run_one).parameters)
 
         def test_snapshot_rule_evaluation_detects_conflict(self):
             snapshot = {
