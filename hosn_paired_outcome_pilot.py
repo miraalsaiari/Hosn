@@ -15,6 +15,7 @@ Commands:
   python3 hosn_paired_outcome_pilot.py --self-test
   python3 hosn_paired_outcome_pilot.py --plan
   sudo python3 hosn_paired_outcome_pilot.py --run
+  sudo python3 hosn_paired_outcome_pilot.py --matrix-pilot
 """
 
 from __future__ import annotations
@@ -38,9 +39,10 @@ from typing import Any, Optional
 
 import hosn_wifi_5g_pilot as base
 import hosn_wifi_5g_compare as compare
+import hosn_heterogeneous_controller as heterogeneous
 
 
-REVISION = "paired-outcome-pilot-v1"
+REVISION = "paired-outcome-pilot-v2-matrix"
 STAY = "STAY"
 HANDOVER = "HANDOVER"
 RUN_ORDER = (
@@ -51,6 +53,82 @@ RUN_ORDER = (
 )
 TRAFFIC_DURATION_S = 18.0
 DECISION_STAGE_INDEX = 2
+
+EXTRA_ACCESS_PROFILES = {
+    # Strong Wi-Fi signal but deliberately congested service: useful for a
+    # conflict where signal favors STAY while measured QoS favors HANDOVER.
+    "wifi_congested_near": {
+        "delay_ms": 55.0, "jitter_ms": 10.0,
+        "loss_pct": 5.0, "rate_mbit": 6.0,
+    },
+    # Weak Wi-Fi signal with good service: useful for the opposite conflict.
+    "wifi_edge_good_qos": {
+        "delay_ms": 5.0, "jitter_ms": 1.0,
+        "loss_pct": 0.0, "rate_mbit": 20.0,
+    },
+    "emulated_5g_congested": {
+        "delay_ms": 60.0, "jitter_ms": 12.0,
+        "loss_pct": 4.0, "rate_mbit": 7.0,
+    },
+}
+ALL_ACCESS_PROFILES = {**compare.ACCESS_PROFILES, **EXTRA_ACCESS_PROFILES}
+
+DEFAULT_SCENARIO = {
+    "id": "outbound_fast_edge_wifi_cell_healthy",
+    "direction": "outbound",
+    "speed_class": "fast",
+    "movement": compare.MOVEMENT,
+    "decision_stage_index": 2,
+    "cell_profile": "emulated_5g_healthy",
+    "design_role": "clear_handover_control",
+    "duration_s": 18.0,
+}
+
+MATRIX_SCENARIOS = (
+    DEFAULT_SCENARIO,
+    {
+        "id": "outbound_slow_weak_wifi_good_qos_cell_congested",
+        "direction": "outbound",
+        "speed_class": "slow",
+        "movement": [
+            {"at_s": 0.0, "x_m": 20.0, "wifi_profile": "wifi_near"},
+            {"at_s": 6.0, "x_m": 40.0, "wifi_profile": "wifi_moving"},
+            {"at_s": 12.0, "x_m": 65.0, "wifi_profile": "wifi_edge_good_qos"},
+        ],
+        "decision_stage_index": 2,
+        "cell_profile": "emulated_5g_congested",
+        "design_role": "conflict_signal_favors_handover_qos_favors_stay",
+        "duration_s": 22.0,
+    },
+    {
+        "id": "inbound_fast_strong_wifi_congested_cell_healthy",
+        "direction": "inbound",
+        "speed_class": "fast",
+        "movement": [
+            {"at_s": 0.0, "x_m": 65.0, "wifi_profile": "wifi_edge"},
+            {"at_s": 4.0, "x_m": 40.0, "wifi_profile": "wifi_moving"},
+            {"at_s": 8.0, "x_m": 20.0, "wifi_profile": "wifi_congested_near"},
+        ],
+        "decision_stage_index": 2,
+        "cell_profile": "emulated_5g_healthy",
+        "design_role": "conflict_signal_favors_stay_qos_favors_handover",
+        "duration_s": 18.0,
+    },
+    {
+        "id": "inbound_slow_near_wifi_cell_congested",
+        "direction": "inbound",
+        "speed_class": "slow",
+        "movement": [
+            {"at_s": 0.0, "x_m": 65.0, "wifi_profile": "wifi_edge"},
+            {"at_s": 6.0, "x_m": 40.0, "wifi_profile": "wifi_moving"},
+            {"at_s": 12.0, "x_m": 20.0, "wifi_profile": "wifi_near"},
+        ],
+        "decision_stage_index": 2,
+        "cell_profile": "emulated_5g_congested",
+        "design_role": "clear_stay_control",
+        "duration_s": 22.0,
+    },
+)
 
 # These tolerances decide only whether a pilot recommendation is sufficiently
 # clear for human review.  They are not labels and are not model thresholds.
@@ -72,9 +150,9 @@ PLAN = {
     "run_order": [{"id": run_id, "action": action} for run_id, action in RUN_ORDER],
     "scenario": {
         "application": "measured UDP video-frame-like workload; not an encoded-video MOS/VMAF claim",
-        "movement": compare.MOVEMENT,
-        "wifi_profiles": compare.ACCESS_PROFILES,
-        "decision_stage": compare.MOVEMENT[DECISION_STAGE_INDEX],
+        "movement": DEFAULT_SCENARIO["movement"],
+        "wifi_profiles": ALL_ACCESS_PROFILES,
+        "decision_stage": DEFAULT_SCENARIO["movement"][DEFAULT_SCENARIO["decision_stage_index"]],
         "cellular_access": "emulated cellular/5G-like IP path; not a 3GPP radio/core",
     },
     "pairing_controls": {
@@ -101,6 +179,14 @@ PLAN = {
         "tolerances": DOMINANCE_TOLERANCES,
         "inconclusive_behavior": "retain INCONCLUSIVE; assign no training label",
     },
+    "matrix_pilot": {
+        "dataset_collection": False,
+        "training_rows_created": 0,
+        "training_labels_assigned": 0,
+        "scenarios": list(MATRIX_SCENARIOS),
+        "replays_per_scenario": len(RUN_ORDER),
+        "total_replays": len(MATRIX_SCENARIOS) * len(RUN_ORDER),
+    },
 }
 
 
@@ -112,9 +198,60 @@ def _percentile(values: list[float], q: float) -> Optional[float]:
     return compare.percentile(values, q)
 
 
+def configure_access_profile(node, interface: str, profile_name: str,
+                             seed: int, seed_supported: bool, run) -> dict:
+    """Apply one declared matrix profile and retain tc verification evidence."""
+    if profile_name not in ALL_ACCESS_PROFILES:
+        raise ValueError("Unknown access profile: " + profile_name)
+    profile = ALL_ACCESS_PROFILES[profile_name]
+    applied_seed = seed if seed_supported else None
+    argv = compare.profile_tc_args(interface, profile, applied_seed)
+    text, code = run(node, argv)
+    if code:
+        raise RuntimeError("tc/netem profile failed: " + text.strip())
+    shown, code = run(node, ["tc", "qdisc", "show", "dev", interface])
+    if code or "netem" not in shown:
+        raise RuntimeError("Could not verify netem on " + interface)
+    return {
+        "name": profile_name,
+        "configured_not_measured": profile,
+        "requested_seed": seed,
+        "applied_seed": applied_seed,
+        "randomization": "seeded" if seed_supported else "unseeded_by_platform_limitation",
+        "tc_show": shown.strip(),
+    }
+
+
+def evaluate_snapshot_rules(snapshot: dict) -> dict:
+    """Evaluate the real controller rules on a measured decision snapshot."""
+    policy = compare.PLAN["hosn_policy"]
+    current = heterogeneous.AccessObservation(
+        access_name="wifi", technology="Wi-Fi RSSI",
+        signal_dbm=snapshot["wifi_rssi_model_dbm"],
+        service_floor_dbm=policy["wifi_service_floor_dbm"],
+        latency_ms=snapshot["wifi_rtt_ms"], loss_pct=snapshot["wifi_loss_pct"],
+        trend_db_per_s=snapshot["wifi_trend_db_per_s"],
+    )
+    candidate = heterogeneous.AccessObservation(
+        access_name="emulated_5g",
+        technology="emulated cellular/5G-like IP path",
+        signal_dbm=snapshot["cell_rsrp_configured_dbm"],
+        service_floor_dbm=policy["emulated_cellular_service_floor_rsrp_dbm"],
+        latency_ms=snapshot["cell_rtt_ms"], loss_pct=snapshot["cell_loss_pct"],
+        trend_db_per_s=snapshot["cell_trend_db_per_s"],
+    )
+    features = heterogeneous.build_features(current, candidate)
+    rule = heterogeneous.evaluate_rules(features)
+    return {
+        "decision": rule.decision, "status": rule.status,
+        "reason": rule.reason, "missing_fields": list(rule.missing_fields),
+        "features": features,
+    }
+
+
 def summarize_outcome(sender: dict, receiver: dict, events: list[dict],
                       action: str, start_ns: int, decision_ns: int,
-                      timing: dict) -> dict:
+                      timing: dict, duration_s: float = TRAFFIC_DURATION_S) -> dict:
     """Summarize raw observations without hiding duplicates or loss."""
     if action not in (STAY, HANDOVER):
         raise ValueError("Unknown action")
@@ -221,7 +358,7 @@ def summarize_outcome(sender: dict, receiver: dict, events: list[dict],
                 "longest_incomplete_run_ms": 1000.0 * longest / compare.FRAME_RATE,
             },
         },
-        "network_throughput_mbps": len(ordered) * compare.PAYLOAD_BYTES * 8 / TRAFFIC_DURATION_S / 1e6,
+        "network_throughput_mbps": len(ordered) * compare.PAYLOAD_BYTES * 8 / duration_s / 1e6,
         "checks": action_checks,
         "pilot_valid": all(boolean_checks),
     }
@@ -333,18 +470,22 @@ def pairing_diagnostics(results: dict[str, dict]) -> dict:
     }
 
 
-def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
-            seed_supported: bool, run, helper) -> dict:
+def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
+            cell_gateway, ap, seed_supported: bool, run, helper) -> dict:
     wifi_if = station.wintfs[0].name
-    station.position = [20.0, 40.0, 0.0]
+    movement = scenario["movement"]
+    decision_stage_index = int(scenario["decision_stage_index"])
+    duration_s = float(scenario["duration_s"])
+    station.position = [float(movement[0]["x_m"]), 40.0, 0.0]
     helper.connect_verified(station, ap, (ap,), run)
     profile_log = {
-        "cell": compare.configure_profile(
-            station, "sta1-5g0", "emulated_5g_healthy", 9001,
+        "cell": configure_access_profile(
+            station, "sta1-5g0", scenario["cell_profile"], 9001,
             seed_supported, run
         )
     }
-    seed_map = {"wifi_near": 1001, "wifi_moving": 1002, "wifi_edge": 1003}
+    wifi_profile_names = list(dict.fromkeys(stage["wifi_profile"] for stage in movement))
+    seed_map = {name: 1001 + index for index, name in enumerate(wifi_profile_names)}
     movement_log = []
     sender_script = replay_dir / "sender.py"
     receiver_script = replay_dir / "receiver.py"
@@ -360,7 +501,7 @@ def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
     sender = receiver = None
     try:
         start = time.monotonic() + 1.5
-        stop = start + TRAFFIC_DURATION_S
+        stop = start + duration_s
         start_ns = int(start * 1e9)
         receiver = server.popen(
             [sys.executable, str(receiver_script), str(base.UDP_PORT), str(stop + 1),
@@ -385,10 +526,10 @@ def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
             "wifi_disconnected_verified": False,
         }
         previous_rssi = previous_elapsed = None
-        for stage_index, stage in enumerate(compare.MOVEMENT):
+        for stage_index, stage in enumerate(movement):
             base.sleep_until(start + stage["at_s"])
             station.position = [stage["x_m"], 40.0, 0.0]
-            profile_log[stage["wifi_profile"]] = compare.configure_profile(
+            profile_log[stage["wifi_profile"]] = configure_access_profile(
                 station, wifi_if, stage["wifi_profile"],
                 seed_map[stage["wifi_profile"]], seed_supported, run,
             )
@@ -403,7 +544,7 @@ def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
                 "wifi_rssi_model_dbm": rssi, "wifi_trend_db_per_s": trend,
             })
             previous_rssi, previous_elapsed = rssi, elapsed
-            if stage_index != DECISION_STAGE_INDEX:
+            if stage_index != decision_stage_index:
                 continue
 
             wifi_probe = base.ping_path(
@@ -419,6 +560,10 @@ def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
             decision_ns = time.monotonic_ns()
             cell_rsrp = compare.PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"]
             snapshot = {
+                "scenario_id": scenario["id"],
+                "direction": scenario["direction"],
+                "speed_class": scenario["speed_class"],
+                "design_role": scenario["design_role"],
                 "wifi_rssi_model_dbm": rssi,
                 "cell_rsrp_configured_dbm": cell_rsrp,
                 "wifi_signal_margin_db": rssi - compare.PLAN["hosn_policy"]["wifi_service_floor_dbm"],
@@ -434,6 +579,7 @@ def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
                     "cell": "constant emulated cellular profile, not RF measurement",
                 },
             }
+            snapshot["rule_evaluation"] = evaluate_snapshot_rules(snapshot)
             if action == HANDOVER:
                 control.write_text("duplicate\n", encoding="utf-8")
                 duplicate_ns = time.monotonic_ns()
@@ -462,9 +608,11 @@ def run_one(action: str, replay_dir: Path, station, server, cell_gateway, ap,
         events = compare.read_events(packets)
         summary = summarize_outcome(
             sender_data, receiver_data, events, action, start_ns, decision_ns,
-            timing,
+            timing, duration_s,
         )
         summary.update(
+            scenario_id=scenario["id"],
+            scenario_design_role=scenario["design_role"],
             decision_snapshot=snapshot,
             timing=timing,
             movement=movement_log,
@@ -529,7 +677,7 @@ def run_pilot(root: Path) -> int:
             replay_dir.mkdir()
             print("\nRunning {} ({})...".format(run_id, action), flush=True)
             result = run_one(
-                action, replay_dir, station, server, cell_gateway, ap,
+                action, DEFAULT_SCENARIO, replay_dir, station, server, cell_gateway, ap,
                 seed_capability["supported"], run, helper,
             )
             results[run_id] = result
@@ -591,6 +739,155 @@ def run_pilot(root: Path) -> int:
             pass
 
 
+def run_matrix_pilot(root: Path) -> int:
+    """Run four small paired scenarios; never emit a training dataset."""
+    import hosn_switch as helper
+    import mn_wifi.net as wifi_module
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    folder = root / "results" / ("paired_matrix_pilot_" + stamp)
+    folder.mkdir(parents=True)
+    compare.write_json(folder / "plan.json", PLAN)
+    source_names = (
+        "hosn_paired_outcome_pilot.py", "hosn_wifi_5g_compare.py",
+        "hosn_wifi_5g_pilot.py", "hosn_switch.py",
+    )
+    manifest = {
+        "revision": REVISION, "status": "starting", "created_utc": stamp,
+        "data_kind": "multi_scenario_paired_pilot_not_training_dataset",
+        "scenario_count": len(MATRIX_SCENARIOS),
+        "planned_replays": len(MATRIX_SCENARIOS) * len(RUN_ORDER),
+        "training_rows_created": 0, "training_labels_assigned": 0,
+        "python": platform.python_version(), "kernel": platform.release(),
+        "machine": platform.machine(),
+        "mininet_wifi_version": str(getattr(wifi_module, "VERSION", "unknown")),
+        "source_sha256": {
+            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in source_names
+        },
+    }
+    compare.write_json(folder / "manifest.json", manifest)
+    network = None
+    old_cwd = Path.cwd()
+    try:
+        os.chdir(folder)
+        network, station, server, wifi_core, cell_gateway, ap = base.create_network()
+        run = helper.NodeCommands(folder / "commands.jsonl")
+        wifi_if = station.wintfs[0].name
+        base.verified_interface(station, cell_gateway, "sta1-5g0")
+        base.verified_interface(server, wifi_core, "h1-wifi0")
+        base.verified_interface(server, cell_gateway, "h1-5g0")
+        base.configure_ip(station, wifi_if, base.WIFI_UE_IP + "/24", run)
+        base.configure_ip(station, "sta1-5g0", base.CELL_UE_IP + "/24", run)
+        base.configure_ip(server, "h1-wifi0", base.WIFI_SERVER_IP + "/24", run)
+        base.configure_ip(server, "h1-5g0", base.CELL_SERVER_IP + "/24", run)
+        seed_capability = compare.detect_netem_seed_support(station, "sta1-5g0", run)
+        manifest["netem_seed_capability"] = seed_capability
+
+        scenario_reports = {}
+        total_completed = 0
+        for scenario in MATRIX_SCENARIOS:
+            scenario_id = scenario["id"]
+            scenario_dir = folder / scenario_id
+            scenario_dir.mkdir()
+            print("\nSCENARIO:", scenario_id, flush=True)
+            results = {}
+            for run_id, action in RUN_ORDER:
+                replay_dir = scenario_dir / run_id
+                replay_dir.mkdir()
+                print("  Running {} ({})...".format(run_id, action), flush=True)
+                result = run_one(
+                    action, scenario, replay_dir, station, server,
+                    cell_gateway, ap, seed_capability["supported"], run, helper,
+                )
+                results[run_id] = result
+                total_completed += 1
+                post = result["post_decision"]
+                print(
+                    "    loss={:.3f}% gap={:.3f}ms frames={:.2f}% goodput={:.3f}Mbps".format(
+                        post["loss_pct"], post["max_interarrival_gap_ms"],
+                        post["frames"]["complete_pct"],
+                        post["application_goodput_mbps"],
+                    ), flush=True,
+                )
+            aggregate = aggregate_by_action(results)
+            recommendation = review_recommendation(aggregate)
+            report = {
+                "scenario": scenario,
+                "results": results,
+                "aggregate_by_action": aggregate,
+                "pairing_diagnostics": pairing_diagnostics(results),
+                "review_recommendation": recommendation,
+                "training_rows_created": 0,
+                "training_labels_assigned": 0,
+                "mechanical_checks_pass": all(item["pilot_valid"] for item in results.values()),
+            }
+            statuses = [
+                item["decision_snapshot"]["rule_evaluation"]["status"]
+                for item in results.values()
+            ]
+            expected_conflict = scenario["design_role"].startswith("conflict_")
+            report["observed_rule_statuses"] = statuses
+            report["scenario_design_check_pass"] = (
+                all(status == "CONFLICT" for status in statuses)
+                if expected_conflict
+                else all(status == "CLEAR" for status in statuses)
+            )
+            scenario_reports[scenario_id] = report
+            compare.write_json(scenario_dir / "scenario_report.json", report)
+            print("  Review recommendation:", recommendation["recommendation_for_human_review"], flush=True)
+
+        valid = all(
+            report["mechanical_checks_pass"] and report["scenario_design_check_pass"]
+            for report in scenario_reports.values()
+        )
+        matrix_report = {
+            "revision": REVISION,
+            "matrix_pilot_only": True,
+            "final_dataset_started": False,
+            "training_rows_created": 0,
+            "training_labels_assigned": 0,
+            "scenario_count": len(scenario_reports),
+            "completed_replays": total_completed,
+            "mechanical_checks_pass": valid,
+            "netem_seed_capability": seed_capability,
+            "scenario_reports": scenario_reports,
+            "honesty_note": (
+                "Recommendations are review candidates, not training labels. "
+                "Inconclusive outcomes remain inconclusive. Unseeded platforms "
+                "use ABBA repeats but cannot reproduce identical random loss events."
+            ),
+        }
+        compare.write_json(folder / "matrix_report.json", matrix_report)
+        manifest["status"] = "matrix_pilot_complete" if valid else "matrix_pilot_checks_failed"
+        manifest["completed_replays"] = total_completed
+        manifest["report_file"] = "matrix_report.json"
+        compare.write_json(folder / "manifest.json", manifest)
+        print("\nPAIRED MATRIX PILOT {} — final dataset NOT started.".format(
+            "COMPLETE" if valid else "CHECKS FAILED"
+        ))
+        print("Completed replays:", total_completed)
+        print("Saved:", folder)
+        return 0 if valid else 1
+    except KeyboardInterrupt:
+        manifest["status"] = "interrupted"
+        return 130
+    except Exception as exc:
+        manifest.update(status="failed", error=type(exc).__name__ + ": " + str(exc))
+        (folder / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        print("\nMATRIX PILOT STOPPED:", exc)
+        return 1
+    finally:
+        if network is not None:
+            network.stop()
+        os.chdir(old_cwd)
+        compare.write_json(folder / "manifest.json", manifest)
+        try:
+            helper.restore_result_owner(folder)
+        except Exception:
+            pass
+
+
 def run_self_tests() -> int:
     import unittest
 
@@ -608,6 +905,43 @@ def run_self_tests() -> int:
 
         def test_decision_stage_is_moving_edge(self):
             self.assertEqual(PLAN["scenario"]["decision_stage"]["wifi_profile"], "wifi_edge")
+
+        def test_matrix_covers_required_contexts(self):
+            self.assertEqual(len(MATRIX_SCENARIOS), 4)
+            self.assertEqual(
+                {(item["direction"], item["speed_class"]) for item in MATRIX_SCENARIOS},
+                {("outbound", "fast"), ("outbound", "slow"),
+                 ("inbound", "fast"), ("inbound", "slow")},
+            )
+            self.assertEqual(
+                sum(item["design_role"].startswith("conflict_") for item in MATRIX_SCENARIOS), 2
+            )
+            self.assertEqual(PLAN["matrix_pilot"]["total_replays"], 16)
+
+        def test_matrix_scenarios_are_executable(self):
+            ids = [item["id"] for item in MATRIX_SCENARIOS]
+            self.assertEqual(len(ids), len(set(ids)))
+            for scenario in MATRIX_SCENARIOS:
+                self.assertIn(scenario["cell_profile"], ALL_ACCESS_PROFILES)
+                self.assertGreaterEqual(scenario["decision_stage_index"], 1)
+                self.assertLess(scenario["decision_stage_index"], len(scenario["movement"]))
+                self.assertGreater(
+                    scenario["duration_s"],
+                    scenario["movement"][scenario["decision_stage_index"]]["at_s"] + 5.0,
+                )
+                for stage in scenario["movement"]:
+                    self.assertIn(stage["wifi_profile"], ALL_ACCESS_PROFILES)
+
+        def test_snapshot_rule_evaluation_detects_conflict(self):
+            snapshot = {
+                "wifi_rssi_model_dbm": -86.0, "cell_rsrp_configured_dbm": -90.0,
+                "wifi_rtt_ms": 10.0, "cell_rtt_ms": 120.0,
+                "wifi_loss_pct": 0.0, "cell_loss_pct": 4.0,
+                "wifi_trend_db_per_s": -3.0, "cell_trend_db_per_s": 0.0,
+            }
+            result = evaluate_snapshot_rules(snapshot)
+            self.assertEqual(result["status"], "CONFLICT")
+            self.assertEqual(result["decision"], "ASK_AI")
 
         def test_dominance_handover(self):
             aggregate = {
@@ -720,6 +1054,7 @@ def main() -> int:
     mode.add_argument("--self-test", action="store_true")
     mode.add_argument("--plan", action="store_true")
     mode.add_argument("--run", action="store_true")
+    mode.add_argument("--matrix-pilot", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return run_self_tests()
@@ -727,15 +1062,18 @@ def main() -> int:
         print(json.dumps(PLAN, indent=2, allow_nan=False))
         return 0
     if sys.platform != "linux" or not hasattr(os, "geteuid") or os.geteuid() != 0:
-        parser.exit(2, "Run --run in Ubuntu with sudo.\n")
+        parser.exit(2, "Run --run or --matrix-pilot in Ubuntu with sudo.\n")
     missing = [name for name in ("ip", "iw", "ping", "tc") if not shutil.which(name)]
     if missing:
         parser.exit(2, "Missing required tools: " + ", ".join(missing) + "\n")
     root = Path(__file__).resolve().parent
-    needed = ("hosn_wifi_5g_compare.py", "hosn_wifi_5g_pilot.py", "hosn_switch.py")
+    needed = (
+        "hosn_wifi_5g_compare.py", "hosn_wifi_5g_pilot.py",
+        "hosn_switch.py", "hosn_heterogeneous_controller.py",
+    )
     if any(not (root / name).is_file() for name in needed):
         parser.exit(2, "Keep this file beside " + ", ".join(needed) + ".\n")
-    return run_pilot(root)
+    return run_matrix_pilot(root) if args.matrix_pilot else run_pilot(root)
 
 
 if __name__ == "__main__":
