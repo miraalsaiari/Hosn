@@ -476,16 +476,22 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
     movement = scenario["movement"]
     decision_stage_index = int(scenario["decision_stage_index"])
     duration_s = float(scenario["duration_s"])
+    seed_offset = int(scenario.get("seed_offset", 0))
+    if seed_offset < 0:
+        raise ValueError("seed_offset must be nonnegative")
     station.position = [float(movement[0]["x_m"]), 40.0, 0.0]
     helper.connect_verified(station, ap, (ap,), run)
     profile_log = {
         "cell": configure_access_profile(
-            station, "sta1-5g0", scenario["cell_profile"], 9001,
+            station, "sta1-5g0", scenario["cell_profile"], 9001 + seed_offset,
             seed_supported, run
         )
     }
     wifi_profile_names = list(dict.fromkeys(stage["wifi_profile"] for stage in movement))
-    seed_map = {name: 1001 + index for index, name in enumerate(wifi_profile_names)}
+    seed_map = {
+        name: 1001 + seed_offset + index
+        for index, name in enumerate(wifi_profile_names)
+    }
     movement_log = []
     sender_script = replay_dir / "sender.py"
     receiver_script = replay_dir / "receiver.py"
@@ -931,6 +937,9 @@ def run_self_tests() -> int:
                 )
                 for stage in scenario["movement"]:
                     self.assertIn(stage["wifi_profile"], ALL_ACCESS_PROFILES)
+
+        def test_campaign_seed_offsets_must_be_nonnegative(self):
+            self.assertTrue(all(item.get("seed_offset", 0) >= 0 for item in MATRIX_SCENARIOS))
 
         def test_snapshot_rule_evaluation_detects_conflict(self):
             snapshot = {
