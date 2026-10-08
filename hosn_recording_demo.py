@@ -54,7 +54,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v3"
+REVISION = "atp-recording-three-scenario-v4"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -170,40 +170,19 @@ def _print_scenario_intro(number: str, info: dict, model_info: dict) -> None:
             "LOADED" if model_info["accepted"] else "UNAVAILABLE",
             "success" if model_info["accepted"] else "critical",
         ))
-    print("\nStarting four real monitoring probes. The rules-first controller")
-    print("decides at the final check; a final rules conflict calls the AI.")
+    if number == "1":
+        print("\nStarting four real monitoring probes. The original HOSN rules")
+        print("evaluate the final measurements after the user moves away from Wi-Fi.")
+    else:
+        print("\nStarting four real monitoring probes. The rules-first controller")
+        print("decides at the final check; a final rules conflict calls the AI.")
     print("Recording probes share the media links; results describe this run.", flush=True)
 
 
 def _print_monitoring_check(snapshot: dict, index: int, total: int,
                             final_check: bool, previous: dict | None,
-                            concise: bool = False) -> None:
+                            rules_only_case: bool = False) -> None:
     _section("CHECK {} / {}  |  LIVE NETWORK MONITORING".format(index, total))
-    if concise:
-        _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
-        _field("Wi-Fi / candidate pings", "{} / {}".format(
-            snapshot.get("wifi_probe_count", "unavailable"),
-            snapshot.get("cell_probe_count", "unavailable")))
-        _field("Wi-Fi AP1 modeled RSSI", _fmt(snapshot.get("wifi_rssi_model_dbm"), 2, " dBm"))
-        _field("Wi-Fi measured RTT", _fmt(snapshot.get("wifi_rtt_ms"), 2, " ms"))
-        _field("Wi-Fi measured loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
-        _field("Wi-Fi modeled trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
-        _field("Candidate configured signal", _fmt(
-            snapshot.get("cell_rsrp_configured_dbm"), 2, " dBm"))
-        _field("Candidate configured trend", _fmt(
-            snapshot.get("cell_trend_db_per_s"), 3, " dB/s"))
-        _field("Candidate measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
-        _field("Candidate measured loss", _fmt(snapshot.get("cell_loss_pct"), 2, "%"))
-        if previous is not None:
-            before, after = previous.get("wifi_rssi_model_dbm"), snapshot.get("wifi_rssi_model_dbm")
-            if _finite_number(before) and _finite_number(after):
-                _field("Wi-Fi signal change", _fmt(after - before, 2, " dB"))
-        _field("Selected sender path", snapshot.get("selected_access_before_decision", "unavailable"))
-        if final_check:
-            print("\nRules evaluating the final measurements now...", flush=True)
-        else:
-            print("\nMonitoring continues. No controller decision has been made yet.", flush=True)
-        return
     _field("Elapsed traffic time", _fmt(snapshot.get("monitor_observed_at_s"), 2, " s"))
     _field("Signal sampled at", _fmt(snapshot.get("monitor_signal_observed_at_s"), 2, " s"))
     _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
@@ -244,8 +223,13 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     if final_check:
         print("\nRULES EVALUATION\n  Evaluating the final measured snapshot now...", flush=True)
     else:
-        print("\nThe selected sender path remains Wi-Fi. Monitoring continues;")
-        print("rules run at Check 4, and AI runs only if those rules conflict.", flush=True)
+        print("\nCONTROLLER STATUS  |  MONITORING ONLY")
+        _field("Selected path", snapshot.get("selected_access_before_decision", "unavailable"))
+        _field("Controller decision", "PENDING CHECK 4")
+        if rules_only_case:
+            print("  HOSN keeps measuring; the rules evaluate the final check.", flush=True)
+        else:
+            print("  HOSN keeps measuring; AI runs only if the final rules conflict.", flush=True)
 
 
 def _print_snapshot(snapshot: dict, decision: dict) -> None:
@@ -290,21 +274,47 @@ def _print_snapshot(snapshot: dict, decision: dict) -> None:
         print("  Current Wi-Fi path remains selected; video-like traffic continues.", flush=True)
 
 
+def _handover_switch_verified(result: dict) -> bool:
+    """Use the executor's recorded packet and Wi-Fi checks, not the intended action."""
+    timing = result.get("timing") or {}
+    checks = result.get("checks") or {}
+    return result.get("action") == paired.HANDOVER and all((
+        timing.get("candidate_verified_ns") is not None,
+        timing.get("wifi_break_ns") is not None,
+        timing.get("wifi_disconnected_verified") is True,
+        checks.get("handover_used_both_paths") is True,
+        checks.get("candidate_verified_before_break") is True,
+        checks.get("wifi_disconnect_verified") is True,
+    ))
+
+
 def _print_result(result: dict, expected_action: str | None = None,
                   expected_source: str | None = None) -> bool:
     post = result["post_decision"]
     decision = result["controller_decision"]
     timing = result.get("timing", {})
-    _section("POST-DECISION VERIFICATION", "success" if result.get("pilot_valid") else "critical")
+    switch_verified = _handover_switch_verified(result)
+    _section("POST-HANDOVER VERIFICATION" if result["action"] == paired.HANDOVER
+             else "POST-DECISION VERIFICATION",
+             "success" if result.get("pilot_valid") and
+             (result["action"] != paired.HANDOVER or switch_verified) else "critical")
     _field("Executed action", result["action"])
     _field("Decision source", decision.get("source", "UNKNOWN"))
     if result["action"] == paired.HANDOVER:
+        _field("Wi-Fi AP1 -> emulated 5G", _color(
+            "SWITCH VERIFIED" if switch_verified else "SWITCH NOT VERIFIED",
+            "success" if switch_verified else "critical"))
+        _field("Selected traffic path", "Emulated cellular/5G-like IP path"
+               if switch_verified else "UNCONFIRMED")
         _field("Candidate packets verified", _yes_no(
             timing.get("candidate_verified_ns") is not None))
-        _field("Wi-Fi disconnect verified", _yes_no(
+        _field("Wi-Fi AP1 disconnected", _yes_no(
             timing.get("wifi_disconnected_verified")))
     else:
-        _field("Selected path", "Wi-Fi (no handover performed)")
+        _field("Handover", "NO - controller chose STAY")
+        _field("Selected traffic path", "Wi-Fi AP1" if
+               result.get("checks", {}).get("stay_used_only_wifi") is True
+               else "UNCONFIRMED")
     print("\nMEASURED UDP VIDEO-LIKE TRAFFIC AFTER DECISION")
     _field("Packet loss", _fmt(post.get("loss_pct"), 3, "%"))
     _field("P95 process delay", _fmt(post.get("p95_one_way_process_delay_ms"), 2, " ms"))
@@ -324,8 +334,12 @@ def _print_result(result: dict, expected_action: str | None = None,
     source_met = expected_source is None or decision.get("source") == expected_source
     ai_met = expected_source is None or bool(decision.get("ai_called")) == (expected_source == "AI")
     goal_met = action_met and source_met and ai_met
-    succeeded = bool(result.get("pilot_valid")) and goal_met
-    if not result.get("pilot_valid"):
+    succeeded = bool(result.get("pilot_valid")) and goal_met and (
+        result["action"] != paired.HANDOVER or switch_verified
+    )
+    if result["action"] == paired.HANDOVER and not switch_verified:
+        closing = "SCENARIO ENDED: HANDOVER SWITCH NOT VERIFIED"
+    elif not result.get("pilot_valid"):
         closing = "SCENARIO ENDED: VERIFICATION FAILED"
     elif not goal_met:
         closing = "SCENARIO ENDED: GOAL NOT OBSERVED"
@@ -451,7 +465,7 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
                                  final_check: bool) -> None:
             nonlocal previous_observation
             _print_monitoring_check(snapshot, check, total, final_check,
-                                    previous_observation, concise=number == "1")
+                                    previous_observation, rules_only_case=number == "1")
             previous_observation = snapshot
 
         def decision_callback(snapshot: dict) -> dict:
@@ -562,22 +576,33 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
                 "source": result["controller_decision"].get("source"),
                 "ai_called": result["controller_decision"].get("ai_called"),
                 "pilot_valid": result.get("pilot_valid"),
+                "handover_switch_verified": _handover_switch_verified(result),
+                "stay_wifi_verified": result.get("checks", {}).get("stay_used_only_wifi") is True,
                 "recording_goal_observed": result["recording_demo"]["recording_goal_observed"],
             })
         all_goals_observed = all(item["recording_goal_observed"] for item in manifest["scenarios"])
         manifest["status"] = "complete" if all_goals_observed else "complete_with_unmet_goals"
         compare.write_json(parent / "manifest.json", manifest)
-        _clear_screen()
         print(_line())
         print("ATP HOSN RECORDING DEMO COMPLETE" if all_goals_observed else
               "ATP HOSN RECORDING FINISHED: SOME GOALS NOT OBSERVED")
         print(_line())
         for item in manifest["scenarios"]:
-            print(
-                "Scenario {number}: action={action} | source={source} | AI={ai_called} | verification={pilot_valid} | goal={recording_goal_observed}".format(
-                    **item
-                )
-            )
+            _section("SCENARIO {} | FINAL RESULT".format(item["number"]),
+                     "success" if item["recording_goal_observed"] else "critical")
+            if item["action"] == paired.HANDOVER:
+                _field("Wi-Fi AP1 -> emulated 5G", "SWITCH VERIFIED" if
+                       item["handover_switch_verified"] else "SWITCH NOT VERIFIED")
+                _field("Selected traffic path", "Emulated cellular/5G-like IP path" if
+                       item["handover_switch_verified"] else "UNCONFIRMED")
+            else:
+                _field("Handover", "NO - controller chose STAY")
+                _field("Selected traffic path", "Wi-Fi AP1" if
+                       item["stay_wifi_verified"] else "UNCONFIRMED")
+            _field("Controller decision", "{} via {}".format(item["action"], item["source"]))
+            _field("AI called", _yes_no(item["ai_called"]))
+            _field("Traffic/mechanical checks", "PASSED" if item["pilot_valid"] else "FAILED")
+            _field("Scenario goal observed", _yes_no(item["recording_goal_observed"]))
         print("\nSaved evidence:", parent)
         print(_line())
         return 0 if all_goals_observed else 1
@@ -591,6 +616,7 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
         compare.write_json(parent / "manifest.json", manifest)
         (parent / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         print("\nDEMO STOPPED:", exc, file=sys.stderr)
+        print("Network switch completion was not verified in this run.", file=sys.stderr)
         print("Saved diagnostics:", parent, file=sys.stderr)
         return 1
     finally:
