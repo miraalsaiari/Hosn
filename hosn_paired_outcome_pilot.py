@@ -475,22 +475,25 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             decision_callback=None, observation_callback=None) -> dict:
     """Run the existing replay and, optionally, expose real recording probes.
 
-    Recording uses one additional observation at the initial position, giving
-    up to four real probes across the existing three movement stages. When both
-    callbacks are supplied, the controller decides after each probe; an early
-    handover ends monitoring because Wi-Fi has been disconnected. Research
-    replays still probe and decide only at the original decision position.
+    Recording supports four distinct movement stages with one real observation
+    per stage. Legacy three-stage recordings still repeat the initial position
+    once, giving four checks. When both callbacks are supplied, the controller
+    decides after each probe; an early handover ends monitoring because Wi-Fi
+    has been disconnected. Research replays still probe and decide only at the
+    original decision position.
     Extra recording probes share the links with media-like traffic, so their
     measured outcomes should not be treated as identical research replays.
+    Optional per-stage cellular access profiles change the configured candidate
+    path, never the constant emulated cellular signal.
     """
     wifi_if = station.wintfs[0].name
     movement = scenario["movement"]
     decision_stage_index = int(scenario["decision_stage_index"])
     recording_mode = observation_callback is not None and decision_callback is not None
     if observation_callback is not None and (
-        len(movement) != 3 or decision_stage_index != len(movement) - 1
+        len(movement) not in (3, 4) or decision_stage_index != len(movement) - 1
     ):
-        raise ValueError("Recording observations need three stages and a final decision stage")
+        raise ValueError("Recording observations need three or four stages and a final decision stage")
     duration_s = float(scenario["duration_s"])
     seed_offset = int(scenario.get("seed_offset", 0))
     if seed_offset < 0:
@@ -508,6 +511,16 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
         name: 1001 + seed_offset + index
         for index, name in enumerate(wifi_profile_names)
     }
+    cell_profile_names = list(dict.fromkeys(
+        [scenario["cell_profile"]] + [
+            stage.get("cell_profile", scenario["cell_profile"]) for stage in movement
+        ]
+    ))
+    cell_seed_map = {
+        name: 9001 + seed_offset + index
+        for index, name in enumerate(cell_profile_names)
+    }
+    active_cell_profile = scenario["cell_profile"]
     movement_log = []
     sender_script = replay_dir / "sender.py"
     receiver_script = replay_dir / "receiver.py"
@@ -562,6 +575,13 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                 station, wifi_if, stage["wifi_profile"],
                 seed_map[stage["wifi_profile"]], seed_supported, run,
             )
+            requested_cell_profile = stage.get("cell_profile", scenario["cell_profile"])
+            if requested_cell_profile != active_cell_profile:
+                profile_log["cell_stage_{:02d}".format(stage_index + 1)] = configure_access_profile(
+                    station, "sta1-5g0", requested_cell_profile,
+                    cell_seed_map[requested_cell_profile], seed_supported, run,
+                )
+                active_cell_profile = requested_cell_profile
             elapsed = time.monotonic() - start
             rssi = base.modeled_wifi_rssi(station, ap)
             trend = None
@@ -576,7 +596,10 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             if stage_index != decision_stage_index and observation_callback is None:
                 continue
 
-            repeat = 2 if observation_callback is not None and stage_index == 0 else 1
+            repeat = (
+                2 if observation_callback is not None and len(movement) == 3
+                and stage_index == 0 else 1
+            )
             for observation in range(repeat):
                 final_observation = stage_index == decision_stage_index and observation == repeat - 1
                 if observation:
@@ -626,6 +649,8 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                 if recording_mode or final_observation:
                     observed["rule_evaluation"] = evaluate_snapshot_rules(observed)
                 if observation_callback is not None:
+                    observed["wifi_ap_distance_m"] = float(station.get_distance_to(ap))
+                    observed["cell_profile_active"] = active_cell_profile
                     observed["monitor_signal_observed_at_s"] = elapsed
                     observed["monitor_observed_at_s"] = time.monotonic() - start
                     observed["wifi_probe_count"] = wifi_probe.get("requested", probe_count)
@@ -640,7 +665,7 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                         "observed_at_s": observed["monitor_observed_at_s"],
                         "snapshot": observed,
                     })
-                    observation_callback(observed, check_number, len(movement) + 1, final_observation)
+                    observation_callback(observed, check_number, 4, final_observation)
                 if not recording_mode and not final_observation:
                     continue
 

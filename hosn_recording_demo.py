@@ -5,8 +5,8 @@ This wrapper reuses the project's accepted measured-data AI, rules-first
 controller, media-like workload, and make-before-break executor.  It runs only
 three presentation scenarios, one at a time, instead of the full 48-replay
 research evaluation.
-Each recording plans four real monitoring observations across three movement
-stages. The existing rules-first controller evaluates every actual check and
+Each recording plans four real monitoring observations at four movement
+positions. The existing rules-first controller evaluates every actual check and
 calls AI immediately if those rules find a conflict. An authorized handover
 executes immediately; monitoring stops because the Wi-Fi link is disconnected.
 Recording-only extra probes share links with the video-like UDP workload, so
@@ -55,7 +55,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v5"
+REVISION = "atp-recording-three-scenario-v6"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -107,12 +107,27 @@ def _recording_scenario(number: str) -> dict:
     """Choose real movement inputs without changing the research scenario matrix."""
     scenario = copy.deepcopy(_scenario_by_id(SCENARIO_SPECS[number]["source_id"]))
     if number == "1":
-        # Stage 2 stays nearer the AP to demonstrate an ordinary rules STAY;
-        # the original final degradation and handover conditions stay intact.
+        # Keep the middle position near Wi-Fi; its old x=40 m was a real
+        # conflict. The original final degradation is left unchanged.
         first, middle = scenario["movement"][:2]
         middle["x_m"] = (first["x_m"] + middle["x_m"]) / 2
         middle["wifi_profile"] = first["wifi_profile"]
         scenario["recording_intermediate_position_adjusted"] = True
+    first, middle, final = scenario["movement"]
+    second = copy.deepcopy(first)
+    second["at_s"] = (first["at_s"] + middle["at_s"]) / 2
+    second["x_m"] = (first["x_m"] + middle["x_m"]) / 2
+    scenario["movement"] = [first, second, middle, final]
+    scenario["decision_stage_index"] = 3
+    if number == "1":
+        # Existing emulated-path profiles change the path's real measured
+        # RTT/loss through tc; the configured signal reference remains fixed.
+        final_cell_profile = scenario["cell_profile"]
+        scenario["cell_profile"] = "emulated_5g_congested"
+        second["cell_profile"] = "cell_eval_poor"
+        middle["cell_profile"] = "cell_eval_fair"
+        final["cell_profile"] = final_cell_profile
+        scenario["recording_candidate_qos_varies"] = True
     return scenario
 
 
@@ -174,12 +189,16 @@ def _countdown(seconds: int = 3) -> None:
     print("  START\n", flush=True)
 
 
-def _print_scenario_intro(number: str, info: dict, model_info: dict) -> None:
+def _print_scenario_intro(number: str, info: dict, model_info: dict,
+                          scenario: dict) -> None:
     _section("ATP DEMONSTRATION  |  HOSN  |  SCENARIO {}".format(number))
     _field("Scenario goal", info["title"])
     _field("Application", "Measured UDP video-call-like traffic")
     _field("Current path", "Wi-Fi AP1 (emulated station)")
     _field("Candidate path", "Emulated cellular/5G-like IP path")
+    _field("Candidate radio signal", _fmt(
+        compare.PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"], 0,
+        " dBm (fixed configured reference; no cellular RF sensor)"))
     _field("Objective", "Maintain video-like traffic quality during movement")
     print("\nSCENARIO SETUP\n  " + info["story"])
     print("\nINITIALIZING HOSN")
@@ -196,6 +215,9 @@ def _print_scenario_intro(number: str, info: dict, model_info: dict) -> None:
     else:
         print("\nStarting up to four real monitoring checks. Rules run after each")
         print("check; a real conflict calls the trained AI immediately.")
+    if scenario.get("recording_candidate_qos_varies"):
+        print("The candidate's emulated service profile changes during movement;")
+        print("its RTT and packet loss below are measured afresh at every check.")
     print("An authorized handover executes immediately and ends Wi-Fi monitoring.")
     print("Recording probes share the media links; results describe this run.", flush=True)
 
@@ -206,6 +228,7 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     _field("Elapsed traffic time", _fmt(snapshot.get("monitor_observed_at_s"), 2, " s"))
     _field("Signal sampled at", _fmt(snapshot.get("monitor_signal_observed_at_s"), 2, " s"))
     _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
+    _field("Distance from Wi-Fi AP1", _fmt(snapshot.get("wifi_ap_distance_m"), 2, " m"))
     _field("Selected sender path", _path_label(snapshot.get("selected_access_before_decision")))
     print("\nHOSN ACTION\n  Existing Wi-Fi and candidate path probes completed.")
     _field("Wi-Fi / candidate pings", "{} / {}".format(
@@ -217,15 +240,15 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     _field("Measured packet loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
     _field("Modeled signal trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
     print("\nCANDIDATE NETWORK  |  Emulated cellular/5G-like IP path")
-    _field("Configured signal", _fmt(snapshot.get("cell_rsrp_configured_dbm"), 2, " dBm"))
+    _field("Emulated service profile", snapshot.get("cell_profile_active", "unavailable"))
     _field("Measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
     _field("Measured packet loss", _fmt(snapshot.get("cell_loss_pct"), 2, "%"))
-    _field("Configured signal trend", _fmt(snapshot.get("cell_trend_db_per_s"), 3, " dB/s"))
     print("\nWHAT CHANGED")
     if previous is None:
         print("  This is the first measurement; no earlier check exists.")
     else:
         for title, key, suffix, digits in (
+            ("Distance from Wi-Fi AP1", "wifi_ap_distance_m", " m", 2),
             ("Wi-Fi modeled RSSI", "wifi_rssi_model_dbm", " dBm", 2),
             ("Wi-Fi measured RTT", "wifi_rtt_ms", " ms", 2),
             ("Wi-Fi measured loss", "wifi_loss_pct", "%", 2),
@@ -240,6 +263,11 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
                 ))
             else:
                 _field(title, "unavailable for comparison")
+        before_profile, after_profile = (previous.get("cell_profile_active"),
+                                         snapshot.get("cell_profile_active"))
+        if before_profile != after_profile:
+            _field("Candidate emulated profile", "{} -> {}".format(
+                before_profile or "unavailable", after_profile or "unavailable"))
     print("\nRULES EVALUATION\n  HOSN is deciding from this check's real measurements...", flush=True)
 
 
@@ -499,7 +527,7 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
          run, helper, seed_capability) = _setup_network(run_folder)
 
         _clear_screen()
-        _print_scenario_intro(number, info, model_info)
+        _print_scenario_intro(number, info, model_info, scenario)
         _countdown(countdown_seconds)
 
         callback_state: dict[str, Any] = {}
@@ -552,9 +580,12 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
             "model_expected_action_was_not_supplied": True,
             "fixed_three_check_gate_used": False,
             "real_monitoring_checks": len(result["recording_checks"]),
-            "additional_probe_at_initial_position": True,
+            "additional_probe_at_initial_position": False,
             "recording_intermediate_position_adjusted": scenario.get(
                 "recording_intermediate_position_adjusted", False),
+            "recording_candidate_qos_varies": scenario.get(
+                "recording_candidate_qos_varies", False),
+            "movement_positions_x_m": [stage["x_m"] for stage in scenario["movement"]],
             "handover_check": result.get("handover_check"),
             "recording_goal_observed": goal_observed,
             "recording_probes_share_media_links": True,
@@ -582,16 +613,26 @@ def _plan() -> None:
     print(_line())
     for number, info in SCENARIO_SPECS.items():
         source = _scenario_by_id(info["source_id"])
+        recording = _recording_scenario(number)
         print("\n{}. {}".format(number, info["title"]))
         print("   " + info["story"])
         print("   Rules/AI role: " + info["point"])
         print("   Movement: {} | speed: {} | decision zone: {}".format(
             source["direction"], source["speed_class"], source["decision_zone"]
         ))
+        print("   Four distinct station positions (m): " + ", ".join(
+            _fmt(stage["x_m"], 1) for stage in recording["movement"]
+        ))
+        if recording.get("recording_candidate_qos_varies"):
+            print("   Candidate service profiles: " + " -> ".join(
+                stage.get("cell_profile", recording["cell_profile"])
+                for stage in recording["movement"]
+            ))
     print("\nThe HOSN controller receives no evaluation answer as an input.")
     print("Up to four checks use real probes and an actual HOSN decision at each check.")
     print("AI runs immediately on a real rules conflict; handover executes when authorized.")
     print("An early handover ends Wi-Fi monitoring before Check 4.")
+    print("The emulated candidate signal is a fixed reference, not a measured 5G RF value.")
     print("The old synthetic hosn_ai_model.pkl is never loaded.")
     print(_line())
 
