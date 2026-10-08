@@ -472,10 +472,23 @@ def pairing_diagnostics(results: dict[str, dict]) -> dict:
 
 def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             cell_gateway, ap, seed_supported: bool, run, helper,
-            decision_callback=None) -> dict:
+            decision_callback=None, observation_callback=None) -> dict:
+    """Run the existing replay and, optionally, expose real recording probes.
+
+    The optional callback is used only by the ATP recording demo. It takes one
+    additional observation at the initial position, giving four real probes
+    across the existing three movement stages. The controller is still called
+    once at the original decision position; research replays retain their path.
+    Extra recording probes share the links with media-like traffic, so their
+    measured outcomes should not be treated as identical research replays.
+    """
     wifi_if = station.wintfs[0].name
     movement = scenario["movement"]
     decision_stage_index = int(scenario["decision_stage_index"])
+    if observation_callback is not None and (
+        len(movement) != 3 or decision_stage_index != len(movement) - 1
+    ):
+        raise ValueError("Recording observations need three stages and a final decision stage")
     duration_s = float(scenario["duration_s"])
     seed_offset = int(scenario.get("seed_offset", 0))
     if seed_offset < 0:
@@ -537,6 +550,7 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             "wifi_disconnected_verified": False,
         }
         previous_rssi = previous_elapsed = None
+        recording_checks = []
         for stage_index, stage in enumerate(movement):
             base.sleep_until(start + stage["at_s"])
             station.position = [stage["x_m"], 40.0, 0.0]
@@ -555,65 +569,105 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                 "wifi_rssi_model_dbm": rssi, "wifi_trend_db_per_s": trend,
             })
             previous_rssi, previous_elapsed = rssi, elapsed
-            if stage_index != decision_stage_index:
+            if stage_index != decision_stage_index and observation_callback is None:
                 continue
 
-            wifi_probe = base.ping_path(
-                station, wifi_if, base.WIFI_SERVER_IP, run,
-                replay_dir / "decision_wifi_ping.txt", helper,
-                count=compare.PROBE_COUNT,
-            )
-            cell_probe = base.ping_path(
-                station, "sta1-5g0", base.CELL_SERVER_IP, run,
-                replay_dir / "decision_cell_ping.txt", helper,
-                count=compare.PROBE_COUNT,
-            )
-            decision_ns = time.monotonic_ns()
-            cell_rsrp = compare.PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"]
-            snapshot = {
-                "scenario_id": scenario["id"],
-                "direction": scenario["direction"],
-                "speed_class": scenario["speed_class"],
-                "design_role": scenario["design_role"],
-                "wifi_rssi_model_dbm": rssi,
-                "cell_rsrp_configured_dbm": cell_rsrp,
-                "wifi_signal_margin_db": rssi - compare.PLAN["hosn_policy"]["wifi_service_floor_dbm"],
-                "cell_signal_margin_db": cell_rsrp - compare.PLAN["hosn_policy"]["emulated_cellular_service_floor_rsrp_dbm"],
-                "wifi_rtt_ms": wifi_probe["rtt_avg_ms"],
-                "cell_rtt_ms": cell_probe["rtt_avg_ms"],
-                "wifi_loss_pct": wifi_probe["loss_pct"],
-                "cell_loss_pct": cell_probe["loss_pct"],
-                "wifi_trend_db_per_s": trend,
-                "cell_trend_db_per_s": 0.0,
-                "signal_provenance": {
-                    "wifi": "Mininet-WiFi propagation model",
-                    "cell": "constant emulated cellular profile, not RF measurement",
-                },
-            }
-            snapshot["rule_evaluation"] = evaluate_snapshot_rules(snapshot)
-            if decision_callback is not None:
-                controller_decision = decision_callback(snapshot)
-                if not isinstance(controller_decision, dict):
-                    raise TypeError("decision_callback must return a dictionary")
-                selected = controller_decision.get("action")
-                if selected not in (STAY, HANDOVER):
-                    raise ValueError("decision_callback action must be STAY or HANDOVER")
-                action = selected
-            if action == HANDOVER:
-                control.write_text("duplicate\n", encoding="utf-8")
-                duplicate_ns = time.monotonic_ns()
-                timing["duplicate_start_ns"] = duplicate_ns
-                verified = compare.wait_for_cell_packets(
-                    packets, duplicate_ns, compare.MIN_VERIFIED_CELL_PACKETS
+            repeat = 2 if observation_callback is not None and stage_index == 0 else 1
+            for observation in range(repeat):
+                final_observation = stage_index == decision_stage_index and observation == repeat - 1
+                if observation:
+                    # A repeated check samples the propagation model again;
+                    # its trend and timestamp refer to this actual observation.
+                    rssi = base.modeled_wifi_rssi(station, ap)
+                    elapsed = time.monotonic() - start
+                    trend = ((rssi - previous_rssi) / (elapsed - previous_elapsed)
+                             if elapsed > previous_elapsed else None)
+                    previous_rssi, previous_elapsed = rssi, elapsed
+                check_number = len(recording_checks) + 1
+                prefix = "decision" if final_observation else "monitor_{:02d}".format(check_number)
+                probe_count = compare.PROBE_COUNT
+                if observation_callback is not None and not final_observation:
+                    probe_count = max(3, compare.PROBE_COUNT // 2)
+                wifi_probe = base.ping_path(
+                    station, wifi_if, base.WIFI_SERVER_IP, run,
+                    replay_dir / (prefix + "_wifi_ping.txt"), helper,
+                    count=probe_count,
                 )
-                if verified < compare.MIN_VERIFIED_CELL_PACKETS:
-                    raise RuntimeError("candidate media path was not verified")
-                timing["candidate_verified_ns"] = time.monotonic_ns()
-                base.sleep_until(duplicate_ns / 1e9 + compare.OVERLAP_MIN_S)
-                control.write_text("5g\n", encoding="utf-8")
-                compare.disconnect_wifi(station, ap, run, helper)
-                timing["wifi_break_ns"] = time.monotonic_ns()
-                timing["wifi_disconnected_verified"] = helper.actual_link(station, run)[0] == ""
+                cell_probe = base.ping_path(
+                    station, "sta1-5g0", base.CELL_SERVER_IP, run,
+                    replay_dir / (prefix + "_cell_ping.txt"), helper,
+                    count=probe_count,
+                )
+                cell_rsrp = compare.PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"]
+                observed = {
+                    "scenario_id": scenario["id"],
+                    "direction": scenario["direction"],
+                    "speed_class": scenario["speed_class"],
+                    "design_role": scenario["design_role"],
+                    "wifi_rssi_model_dbm": rssi,
+                    "cell_rsrp_configured_dbm": cell_rsrp,
+                    "wifi_signal_margin_db": rssi - compare.PLAN["hosn_policy"]["wifi_service_floor_dbm"],
+                    "cell_signal_margin_db": cell_rsrp - compare.PLAN["hosn_policy"]["emulated_cellular_service_floor_rsrp_dbm"],
+                    "wifi_rtt_ms": wifi_probe["rtt_avg_ms"],
+                    "cell_rtt_ms": cell_probe["rtt_avg_ms"],
+                    "wifi_loss_pct": wifi_probe["loss_pct"],
+                    "cell_loss_pct": cell_probe["loss_pct"],
+                    "wifi_trend_db_per_s": trend,
+                    "cell_trend_db_per_s": 0.0,
+                    "signal_provenance": {
+                        "wifi": "Mininet-WiFi propagation model",
+                        "cell": "constant emulated cellular profile, not RF measurement",
+                    },
+                }
+                if observation_callback is not None:
+                    observed["monitor_signal_observed_at_s"] = elapsed
+                    observed["monitor_observed_at_s"] = time.monotonic() - start
+                    observed["wifi_probe_count"] = wifi_probe.get("requested", probe_count)
+                    observed["cell_probe_count"] = cell_probe.get("requested", probe_count)
+                    observed["emulated_station_x_m"] = float(station.position[0])
+                    observed["selected_access_before_decision"] = control.read_text(
+                        encoding="utf-8"
+                    ).strip()
+                    if not final_observation:
+                        # A read-only rules diagnostic, never an authorization
+                        # or an additional call to the controller or AI.
+                        observed["monitoring_rules_preview"] = evaluate_snapshot_rules(observed)
+                    recording_checks.append({
+                        "number": check_number, "final": final_observation,
+                        "stage_index": stage_index,
+                        "observed_at_s": observed["monitor_observed_at_s"],
+                        "snapshot": observed,
+                    })
+                    observation_callback(observed, check_number, len(movement) + 1, final_observation)
+                if not final_observation:
+                    continue
+
+                decision_ns = time.monotonic_ns()
+                snapshot = observed
+                snapshot["rule_evaluation"] = evaluate_snapshot_rules(snapshot)
+                if decision_callback is not None:
+                    controller_decision = decision_callback(snapshot)
+                    if not isinstance(controller_decision, dict):
+                        raise TypeError("decision_callback must return a dictionary")
+                    selected = controller_decision.get("action")
+                    if selected not in (STAY, HANDOVER):
+                        raise ValueError("decision_callback action must be STAY or HANDOVER")
+                    action = selected
+                if action == HANDOVER:
+                    control.write_text("duplicate\n", encoding="utf-8")
+                    duplicate_ns = time.monotonic_ns()
+                    timing["duplicate_start_ns"] = duplicate_ns
+                    verified = compare.wait_for_cell_packets(
+                        packets, duplicate_ns, compare.MIN_VERIFIED_CELL_PACKETS
+                    )
+                    if verified < compare.MIN_VERIFIED_CELL_PACKETS:
+                        raise RuntimeError("candidate media path was not verified")
+                    timing["candidate_verified_ns"] = time.monotonic_ns()
+                    base.sleep_until(duplicate_ns / 1e9 + compare.OVERLAP_MIN_S)
+                    control.write_text("5g\n", encoding="utf-8")
+                    compare.disconnect_wifi(station, ap, run, helper)
+                    timing["wifi_break_ns"] = time.monotonic_ns()
+                    timing["wifi_disconnected_verified"] = helper.actual_link(station, run)[0] == ""
 
         if decision_ns is None or snapshot is None:
             raise RuntimeError("decision snapshot was not captured")
@@ -639,6 +693,8 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             profiles=profile_log,
             netem_seed_supported=seed_supported,
         )
+        if observation_callback is not None:
+            summary["recording_checks"] = recording_checks
         compare.write_json(replay_dir / "summary.json", summary)
         return summary
     finally:

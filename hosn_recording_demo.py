@@ -5,6 +5,11 @@ This wrapper reuses the project's accepted measured-data AI, rules-first
 controller, media-like workload, and make-before-break executor.  It runs only
 three presentation scenarios, one at a time, instead of the full 48-replay
 research evaluation.
+Each recording makes four real monitoring observations across the existing
+three movement stages. Early rules diagnostics do not authorize an action;
+the original controller still decides once at the final movement stage.
+Recording-only extra probes share links with the video-like UDP workload, so
+these run outcomes should not be compared as identical research replays.
 
 Commands (from /home/mira/Hosn):
     python3 hosn_recording_demo.py --plan
@@ -48,7 +53,12 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v1"
+REVISION = "atp-recording-three-scenario-v2"
+COLOR_MODE = "auto"
+COLORS = {
+    "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
+    "ai": "\033[95m", "critical": "\033[91m",
+}
 
 SCENARIO_SPECS = {
     "1": {
@@ -58,7 +68,8 @@ SCENARIO_SPECS = {
             "The user moves away from Wi-Fi. Wi-Fi signal and service become poor, "
             "while the emulated cellular/5G-like path is clearly better."
         ),
-        "point": "This proves clear cases are handled directly by rules; AI is not called.",
+        "point": "Designed to show a clear rules case; the observed result comes from the controller.",
+        "expected_source": "RULES",
     },
     "2": {
         "source_id": "eval03_near_out_slow_conflict_handover",
@@ -67,7 +78,8 @@ SCENARIO_SPECS = {
             "Wi-Fi is still physically near/strong, but its delay and loss are poor. "
             "Signal alone favors staying; service quality favors the candidate path."
         ),
-        "point": "This is an ambiguous case, so the accepted AI must make the final choice.",
+        "point": "Designed to test a conflict; AI runs only if the real rules detect one.",
+        "expected_source": "AI",
     },
     "3": {
         "source_id": "eval01_edge_out_fast_conflict_stay",
@@ -77,6 +89,7 @@ SCENARIO_SPECS = {
             "path has a better signal margin but poorer delay/loss."
         ),
         "point": "This shows why blindly choosing the stronger signal can be wrong.",
+        "expected_source": "AI",
     },
 }
 
@@ -90,6 +103,23 @@ def _scenario_by_id(identifier: str) -> dict:
 
 def _line(char: str = "=", width: int = 78) -> str:
     return char * width
+
+
+def _color(text: str, kind: str = "info") -> str:
+    enabled = COLOR_MODE == "always" or (
+        COLOR_MODE == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    )
+    return COLORS.get(kind, "") + text + "\033[0m" if enabled else text
+
+
+def _section(title: str, kind: str = "info") -> None:
+    print("\n" + _color(_line(), kind))
+    print(_color(title, kind))
+    print(_color(_line(), kind), flush=True)
+
+
+def _field(label: str, value: Any) -> None:
+    print("  {:<25} {}".format(label, value))
 
 
 def _finite_number(value: Any) -> bool:
@@ -123,90 +153,163 @@ def _countdown(seconds: int = 3) -> None:
     print("  START\n", flush=True)
 
 
-def _print_scenario_intro(number: str, info: dict) -> None:
-    print(_line())
-    print("ATP HOSN RECORDING DEMO — SCENARIO {}".format(number))
-    print(info["title"])
-    print(_line())
-    print("\nSCENARIO")
-    print(info["story"])
-    print("\nWHY IT MATTERS")
-    print(info["point"])
-    print("\nArchitecture: MEASURE -> RULES -> AI only if CONFLICT -> EXECUTE -> VERIFY")
-    print("No fixed three-check gate is used in this recording demo.")
-    print(_line("-"))
+def _print_scenario_intro(number: str, info: dict, model_info: dict) -> None:
+    _section("ATP DEMONSTRATION  |  HOSN  |  SCENARIO {}".format(number))
+    _field("Scenario goal", info["title"])
+    _field("Application", "Measured UDP video-call-like traffic")
+    _field("Current path", "Wi-Fi AP1 (emulated station)")
+    _field("Candidate path", "Emulated cellular/5G-like IP path")
+    _field("Objective", "Maintain video-like traffic quality during movement")
+    print("\nSCENARIO SETUP\n  " + info["story"])
+    print("\nINITIALIZING HOSN")
+    _field("Topology interfaces", _color("VERIFIED", "success"))
+    _field("Existing controller", _color("READY", "success"))
+    _field("Accepted measured-data AI", _color(
+        "LOADED" if model_info["accepted"] else "UNAVAILABLE",
+        "success" if model_info["accepted"] else "critical",
+    ))
+    print("\nStarting four real monitoring probes. Rules and AI make the final")
+    print("controller decision at the existing decision position.")
+    print("Recording probes share the media links; results describe this run.", flush=True)
+
+
+def _print_monitoring_check(snapshot: dict, index: int, total: int,
+                            final_check: bool, previous: dict | None) -> None:
+    _section("CHECK {} / {}  |  LIVE NETWORK MONITORING".format(index, total))
+    _field("Elapsed traffic time", _fmt(snapshot.get("monitor_observed_at_s"), 2, " s"))
+    _field("Signal sampled at", _fmt(snapshot.get("monitor_signal_observed_at_s"), 2, " s"))
+    _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
+    _field("Selected sender path", snapshot.get("selected_access_before_decision", "unavailable"))
+    print("\nHOSN ACTION\n  Existing Wi-Fi and candidate path probes completed.")
+    _field("Wi-Fi / candidate pings", "{} / {}".format(
+        snapshot.get("wifi_probe_count", "unavailable"),
+        snapshot.get("cell_probe_count", "unavailable")))
+    print("\nCURRENT NETWORK  |  Wi-Fi AP1")
+    _field("Modeled RSSI", _fmt(snapshot.get("wifi_rssi_model_dbm"), 2, " dBm"))
+    _field("Measured RTT", _fmt(snapshot.get("wifi_rtt_ms"), 2, " ms"))
+    _field("Measured packet loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
+    _field("Modeled signal trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
+    print("\nCANDIDATE NETWORK  |  Emulated cellular/5G-like IP path")
+    _field("Configured signal", _fmt(snapshot.get("cell_rsrp_configured_dbm"), 2, " dBm"))
+    _field("Measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
+    _field("Measured packet loss", _fmt(snapshot.get("cell_loss_pct"), 2, "%"))
+    _field("Configured signal trend", _fmt(snapshot.get("cell_trend_db_per_s"), 3, " dB/s"))
+    print("\nWHAT CHANGED")
+    if previous is None:
+        print("  This is the first measurement; no earlier check exists.")
+    else:
+        for title, key, suffix, digits in (
+            ("Wi-Fi modeled RSSI", "wifi_rssi_model_dbm", " dBm", 2),
+            ("Wi-Fi measured RTT", "wifi_rtt_ms", " ms", 2),
+            ("Wi-Fi measured loss", "wifi_loss_pct", "%", 2),
+            ("Candidate measured RTT", "cell_rtt_ms", " ms", 2),
+            ("Candidate measured loss", "cell_loss_pct", "%", 2),
+        ):
+            before, after = previous.get(key), snapshot.get(key)
+            if _finite_number(before) and _finite_number(after):
+                _field(title, "{:+.{digits}f}{suffix} ({} -> {})".format(
+                    after - before, _fmt(before, digits, suffix),
+                    _fmt(after, digits, suffix), digits=digits, suffix=suffix,
+                ))
+            else:
+                _field(title, "unavailable for comparison")
+    if final_check:
+        print("\nRULES EVALUATION\n  Evaluating the final measured snapshot now...", flush=True)
+    else:
+        preview = snapshot.get("monitoring_rules_preview") or {}
+        print("\nRULES DIAGNOSTIC  |  MONITORING ONLY")
+        _field("Rules result", "{} | {}".format(
+            preview.get("decision", "unavailable"), preview.get("status", "unavailable")))
+        _field("Rules reason", preview.get("reason", "unavailable"))
+        print("  This is not a controller decision; AI and action are pending.")
+        print("  The selected sender path remains Wi-Fi; monitoring continues...", flush=True)
 
 
 def _print_snapshot(snapshot: dict, decision: dict) -> None:
     rule = snapshot.get("rule_evaluation", {})
-    print("\n" + _line("="))
-    print("LIVE DECISION SNAPSHOT")
-    print(_line("="))
-    print(
-        "Current Wi-Fi : signal {} | RTT {} | loss {} | trend {}".format(
-            _fmt(snapshot.get("wifi_rssi_model_dbm"), 2, " dBm"),
-            _fmt(snapshot.get("wifi_rtt_ms"), 2, " ms"),
-            _fmt(snapshot.get("wifi_loss_pct"), 2, "%"),
-            _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"),
-        )
-    )
-    print(
-        "Candidate path: signal {} | RTT {} | loss {} | trend {}".format(
-            _fmt(snapshot.get("cell_rsrp_configured_dbm"), 2, " dBm"),
-            _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"),
-            _fmt(snapshot.get("cell_loss_pct"), 2, "%"),
-            _fmt(snapshot.get("cell_trend_db_per_s"), 3, " dB/s"),
-        )
-    )
-    print("\nRULE LAYER")
-    print("  Result : {} | {}".format(rule.get("decision", "UNKNOWN"), rule.get("status", "UNKNOWN")))
-    print("  Reason : {}".format(rule.get("reason", "No reason recorded.")))
-    print("\nFINAL CONTROLLER")
-    print("  AI called      : {}".format(_yes_no(decision.get("ai_called"))))
-    print("  Decision source: {}".format(decision.get("source", "UNKNOWN")))
-    print("  FINAL ACTION   : {}".format(decision.get("action", "UNKNOWN")))
-    print("  Reason         : {}".format(decision.get("reason", "No reason recorded.")))
-    print(_line("="), flush=True)
+    _section("RULES EVALUATION", "warning" if rule.get("status") == "CONFLICT" else "info")
+    _field("Rules status", rule.get("status", "UNKNOWN"))
+    _field("Rules result", rule.get("decision", "UNKNOWN"))
+    _field("Reason", rule.get("reason", "No reason recorded."))
+    controller = decision.get("controller_result") or {}
+    if decision.get("ai_called"):
+        _section("AI ANALYSIS  |  TRAINED MEASURED-DATA MODEL", "ai")
+        print("  Rules found a conflict. The controller called the trained model")
+        print("  with the ordered feature vector, including service quality.")
+        features = controller.get("features") or {}
+        order = final.heterogeneous.AI_FEATURE_ORDER
+        for name in order:
+            _field(name, _fmt(features.get(name), 6))
+        if all(_finite_number(features.get(name)) for name in order):
+            row = [[float(features[name]) for name in order]]
+            _field("Exact model.predict row", repr(row))
+        else:
+            _field("Model input", "unavailable in controller trace")
+        prediction = controller.get("ai_prediction")
+        _field("Actual AI prediction", prediction if prediction is not None
+               else "unavailable (model did not return a usable prediction)")
+    _section("FINAL CONTROLLER")
+    _field("Rules result", "{} | {}".format(
+        rule.get("decision", "UNKNOWN"), rule.get("status", "UNKNOWN")))
+    _field("AI called", _yes_no(decision.get("ai_called")))
+    _field("Decision source", decision.get("source", "UNKNOWN"))
+    _field("Controller status", decision.get("status", "UNKNOWN"))
+    _field("Handover authorized", _yes_no(decision.get("handover_authorized")))
+    _field("Final decision", _color(str(decision.get("action", "UNKNOWN")),
+                                     "success" if decision.get("action") == paired.HANDOVER
+                                     else "warning"))
+    _field("Controller reason", decision.get("reason", "No reason recorded."))
+    if decision.get("action") == paired.HANDOVER:
+        _section("EXECUTING EXISTING MAKE-BEFORE-BREAK HANDOVER", "warning")
+        print("  The executor will duplicate traffic, verify candidate packets,")
+        print("  select the 5G-like path, and then disconnect Wi-Fi.", flush=True)
+    else:
+        print("  Current Wi-Fi path remains selected; video-like traffic continues.", flush=True)
 
 
-def _print_result(result: dict) -> None:
+def _print_result(result: dict, expected_action: str | None = None,
+                  expected_source: str | None = None) -> bool:
     post = result["post_decision"]
     decision = result["controller_decision"]
     timing = result.get("timing", {})
-    print("\n" + _line("="))
-    print("ACTION EXECUTED AND OUTCOME MEASURED")
-    print(_line("="))
-    print("Executed action      : {}".format(result["action"]))
-    print("Decision source      : {}".format(decision.get("source", "UNKNOWN")))
-    print("AI used              : {}".format(_yes_no(decision.get("ai_called"))))
+    _section("POST-DECISION VERIFICATION", "success" if result.get("pilot_valid") else "critical")
+    _field("Executed action", result["action"])
+    _field("Decision source", decision.get("source", "UNKNOWN"))
     if result["action"] == paired.HANDOVER:
-        print("Candidate verified   : {}".format(
-            _yes_no(timing.get("candidate_verified_ns") is not None)
-        ))
-        print("Wi-Fi break verified : {}".format(
-            _yes_no(timing.get("wifi_disconnected_verified"))
-        ))
+        _field("Candidate packets verified", _yes_no(
+            timing.get("candidate_verified_ns") is not None))
+        _field("Wi-Fi disconnect verified", _yes_no(
+            timing.get("wifi_disconnected_verified")))
     else:
-        print("Connection choice    : stayed on current Wi-Fi path")
-    print("\nPOST-DECISION VIDEO-LIKE TRAFFIC")
-    print("  Packet loss         : {}".format(_fmt(post.get("loss_pct"), 3, "%")))
-    print("  P95 process delay   : {}".format(
-        _fmt(post.get("p95_one_way_process_delay_ms"), 2, " ms")
+        _field("Selected path", "Wi-Fi (no handover performed)")
+    print("\nMEASURED UDP VIDEO-LIKE TRAFFIC AFTER DECISION")
+    _field("Packet loss", _fmt(post.get("loss_pct"), 3, "%"))
+    _field("P95 process delay", _fmt(post.get("p95_one_way_process_delay_ms"), 2, " ms"))
+    _field("Interarrival jitter", _fmt(post.get("rfc3550_interarrival_jitter_ms"), 2, " ms"))
+    _field("Maximum packet gap", _fmt(post.get("max_interarrival_gap_ms"), 2, " ms"))
+    _field("Complete frames", _fmt(post.get("frames", {}).get("complete_pct"), 2, "%"))
+    _field("Application goodput", _fmt(post.get("application_goodput_mbps"), 3, " Mbps"))
+    _field("Traffic/mechanical checks", _color(
+        "PASSED" if result.get("pilot_valid") else "FAILED",
+        "success" if result.get("pilot_valid") else "critical",
     ))
-    print("  Jitter              : {}".format(
-        _fmt(post.get("rfc3550_interarrival_jitter_ms"), 2, " ms")
-    ))
-    print("  Maximum packet gap  : {}".format(
-        _fmt(post.get("max_interarrival_gap_ms"), 2, " ms")
-    ))
-    print("  Complete frames     : {}".format(
-        _fmt(post.get("frames", {}).get("complete_pct"), 2, "%")
-    ))
-    print("  Application goodput : {}".format(
-        _fmt(post.get("application_goodput_mbps"), 3, " Mbps")
-    ))
-    print("\nMechanical checks passed: {}".format(_yes_no(result.get("pilot_valid"))))
-    print(_line("="), flush=True)
+    if expected_action is not None:
+        _field("Recording goal", "{} via {}".format(expected_action, expected_source))
+        _field("Observed decision", "{} via {}".format(
+            result["action"], decision.get("source", "UNKNOWN")))
+    action_met = expected_action is None or result["action"] == expected_action
+    source_met = expected_source is None or decision.get("source") == expected_source
+    ai_met = expected_source is None or bool(decision.get("ai_called")) == (expected_source == "AI")
+    goal_met = action_met and source_met and ai_met
+    succeeded = bool(result.get("pilot_valid")) and goal_met
+    if not result.get("pilot_valid"):
+        closing = "SCENARIO ENDED: VERIFICATION FAILED"
+    elif not goal_met:
+        closing = "SCENARIO ENDED: GOAL NOT OBSERVED"
+    else:
+        closing = "SCENARIO COMPLETE"
+    _section(closing, "success" if succeeded else "critical")
+    return succeeded
 
 
 def _model_summary(report: dict, model_path: Path) -> dict:
@@ -301,7 +404,7 @@ def _setup_network(run_folder: Path):
     return network, station, server, wifi_core, cell_gateway, ap, run, helper, seed_capability
 
 
-def _run_one_scenario(root: Path, number: str, model, parent: Path,
+def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: Path,
                       countdown_seconds: int, hold_seconds: float) -> dict:
     info = SCENARIO_SPECS[number]
     scenario = _scenario_by_id(info["source_id"])
@@ -315,10 +418,18 @@ def _run_one_scenario(root: Path, number: str, model, parent: Path,
          run, helper, seed_capability) = _setup_network(run_folder)
 
         _clear_screen()
-        _print_scenario_intro(number, info)
+        _print_scenario_intro(number, info, model_info)
         _countdown(countdown_seconds)
 
         callback_state: dict[str, Any] = {}
+        previous_observation: dict | None = None
+
+        def observation_callback(snapshot: dict, check: int, total: int,
+                                 final_check: bool) -> None:
+            nonlocal previous_observation
+            _print_monitoring_check(snapshot, check, total, final_check,
+                                    previous_observation)
+            previous_observation = snapshot
 
         def decision_callback(snapshot: dict) -> dict:
             decision = final.decide(router.HOSN_FULL_AI, snapshot, model)
@@ -339,16 +450,25 @@ def _run_one_scenario(root: Path, number: str, model, parent: Path,
             run,
             helper,
             decision_callback=decision_callback,
+            observation_callback=observation_callback,
         )
         if "snapshot" not in callback_state:
             raise RuntimeError("The decision callback was never reached.")
-        _print_result(result)
+        if len(result.get("recording_checks", ())) != 4:
+            raise RuntimeError("The recording did not collect four real monitoring checks.")
+        goal_observed = _print_result(
+            result, scenario["expected_action_for_evaluation_only"], info["expected_source"]
+        )
         result["recording_demo"] = {
             "revision": REVISION,
             "scenario_number": number,
             "scenario_title": info["title"],
             "model_expected_action_was_not_supplied": True,
             "fixed_three_check_gate_used": False,
+            "real_monitoring_checks": len(result["recording_checks"]),
+            "additional_probe_at_initial_position": True,
+            "recording_goal_observed": goal_observed,
+            "recording_probes_share_media_links": True,
         }
         compare.write_json(run_folder / "recording_summary.json", result)
         if hold_seconds > 0:
@@ -380,6 +500,8 @@ def _plan() -> None:
             source["direction"], source["speed_class"], source["decision_zone"]
         ))
     print("\nThe final HOSN controller receives no evaluation answer as an input.")
+    print("Four recording checks use real probes; only the final check decides.")
+    print("Checks 1-3 show read-only rule diagnostics, never controller STAY votes.")
     print("The old synthetic hosn_ai_model.pkl is never loaded.")
     print(_line())
 
@@ -407,7 +529,8 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
     try:
         for number in numbers:
             result = _run_one_scenario(
-                root, number, model, parent, countdown_seconds, hold_seconds
+                root, number, model, model_info, parent,
+                countdown_seconds, hold_seconds
             )
             manifest["scenarios"].append({
                 "number": number,
@@ -416,22 +539,25 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
                 "source": result["controller_decision"].get("source"),
                 "ai_called": result["controller_decision"].get("ai_called"),
                 "pilot_valid": result.get("pilot_valid"),
+                "recording_goal_observed": result["recording_demo"]["recording_goal_observed"],
             })
-        manifest["status"] = "complete"
+        all_goals_observed = all(item["recording_goal_observed"] for item in manifest["scenarios"])
+        manifest["status"] = "complete" if all_goals_observed else "complete_with_unmet_goals"
         compare.write_json(parent / "manifest.json", manifest)
         _clear_screen()
         print(_line())
-        print("ATP HOSN RECORDING DEMO COMPLETE")
+        print("ATP HOSN RECORDING DEMO COMPLETE" if all_goals_observed else
+              "ATP HOSN RECORDING FINISHED: SOME GOALS NOT OBSERVED")
         print(_line())
         for item in manifest["scenarios"]:
             print(
-                "Scenario {number}: action={action} | source={source} | AI={ai_called} | checks={pilot_valid}".format(
+                "Scenario {number}: action={action} | source={source} | AI={ai_called} | verification={pilot_valid} | goal={recording_goal_observed}".format(
                     **item
                 )
             )
         print("\nSaved evidence:", parent)
         print(_line())
-        return 0
+        return 0 if all_goals_observed else 1
     except KeyboardInterrupt:
         manifest["status"] = "interrupted"
         compare.write_json(parent / "manifest.json", manifest)
@@ -460,10 +586,14 @@ def main() -> int:
     mode.add_argument("--plan", action="store_true", help="Show the three demo scenarios")
     mode.add_argument("--check-model", action="store_true", help="Verify the accepted measured-data AI")
     mode.add_argument("--scenario", choices=("1", "2", "3", "all"), help="Run one or all scenarios")
-    parser.add_argument("--countdown", type=int, default=3, help="Seconds before traffic starts")
+    parser.add_argument("--countdown", type=int, default=0, help="Seconds before traffic starts")
     parser.add_argument("--hold-seconds", type=float, default=6.0,
                         help="Keep each result visible before cleanup")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                        help="ANSI terminal colors")
     args = parser.parse_args()
+    global COLOR_MODE
+    COLOR_MODE = args.color
     root = Path(__file__).resolve().parent
     if args.plan:
         _plan()
