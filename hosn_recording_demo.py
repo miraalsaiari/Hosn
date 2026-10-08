@@ -55,7 +55,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v7"
+REVISION = "atp-recording-three-scenario-v8"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -210,7 +210,7 @@ def _print_scenario_intro(number: str, info: dict, model_info: dict,
     _field("Application", "Measured UDP video-call-like traffic")
     _field("Current path", "Wi-Fi AP1 (emulated station)")
     _field("Candidate path", "Emulated cellular/5G-like IP path")
-    _field("Candidate radio signal", _fmt(
+    _field("Candidate strength ref.", _fmt(
         compare.PLAN["hosn_policy"]["emulated_cellular_rsrp_dbm"], 0,
         " dBm (fixed configured reference; no cellular RF sensor)"))
     _field("Objective", "Maintain video-like traffic quality during movement")
@@ -242,20 +242,26 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     _field("Elapsed traffic time", _fmt(snapshot.get("monitor_observed_at_s"), 2, " s"))
     _field("Signal sampled at", _fmt(snapshot.get("monitor_signal_observed_at_s"), 2, " s"))
     _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
-    _field("Distance from Wi-Fi AP1", _fmt(snapshot.get("wifi_ap_distance_m"), 2, " m"))
+    _field("Distance from Wi-Fi AP1", _fmt(
+        snapshot.get("wifi_ap_distance_m"), 2, " m (emulated layout)"))
+    _field("Distance from candidate", "N/A (emulated 5G path has no AP2)")
     _field("Selected sender path", _path_label(snapshot.get("selected_access_before_decision")))
     print("\nHOSN ACTION\n  Existing Wi-Fi and candidate path probes completed.")
     _field("Wi-Fi / candidate pings", "{} / {}".format(
         snapshot.get("wifi_probe_count", "unavailable"),
         snapshot.get("cell_probe_count", "unavailable")))
     print("\nCURRENT NETWORK  |  Wi-Fi AP1")
-    _field("Modeled RSSI", _fmt(snapshot.get("wifi_rssi_model_dbm"), 2, " dBm"))
+    _field("Wi-Fi strength (RSSI)", _fmt(
+        snapshot.get("wifi_rssi_model_dbm"), 2, " dBm (modeled)"))
     _field("Measured RTT", _fmt(snapshot.get("wifi_rtt_ms"), 2, " ms"))
     _field("Measured packet loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
     _field("Modeled signal trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
     print("\nCANDIDATE NETWORK  |  Emulated cellular/5G-like IP path")
     _field("Configured path condition", _candidate_condition(
         snapshot.get("cell_profile_active")))
+    _field("Signal strength reference", _fmt(
+        snapshot.get("cell_rsrp_configured_dbm"), 2,
+        " dBm (fixed configuration; no 5G RF reading)"))
     _field("Measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
     _field("Measured packet loss", _fmt(snapshot.get("cell_loss_pct"), 2, "%"))
     print("\nWHAT CHANGED")
