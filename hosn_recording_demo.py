@@ -55,7 +55,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v10"
+REVISION = "atp-recording-three-scenario-v11"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -344,6 +344,22 @@ def _handover_switch_verified(result: dict) -> bool:
     ))
 
 
+def _print_traffic_window(label: str, measurements: dict) -> None:
+    """Show the measured packet window with the same fields at both result points."""
+    print("\nMEASURED UDP VIDEO-LIKE TRAFFIC " + label)
+    _field("Packet loss", _fmt(measurements.get("loss_pct"), 3, "%"))
+    _field("P95 process delay", _fmt(
+        measurements.get("p95_one_way_process_delay_ms"), 2, " ms"))
+    _field("Interarrival jitter", _fmt(
+        measurements.get("rfc3550_interarrival_jitter_ms"), 2, " ms"))
+    _field("Maximum packet gap", _fmt(
+        measurements.get("max_interarrival_gap_ms"), 2, " ms"))
+    _field("Complete frames", _fmt(
+        measurements.get("frames", {}).get("complete_pct"), 2, "%"))
+    _field("Application goodput", _fmt(
+        measurements.get("application_goodput_mbps"), 3, " Mbps"))
+
+
 def _print_result(result: dict, expected_action: str | None = None,
                   expected_source: str | None = None) -> bool:
     pre = result["pre_decision"]
@@ -387,20 +403,8 @@ def _print_result(result: dict, expected_action: str | None = None,
         _field("Selected traffic path", "Wi-Fi AP1" if
                result.get("checks", {}).get("stay_used_only_wifi") is True
                else "UNCONFIRMED")
-    print("\nMEASURED UDP VIDEO-LIKE TRAFFIC BEFORE DECISION")
-    _field("Packet loss", _fmt(pre.get("loss_pct"), 3, "%"))
-    _field("P95 process delay", _fmt(pre.get("p95_one_way_process_delay_ms"), 2, " ms"))
-    _field("Interarrival jitter", _fmt(pre.get("rfc3550_interarrival_jitter_ms"), 2, " ms"))
-    _field("Maximum packet gap", _fmt(pre.get("max_interarrival_gap_ms"), 2, " ms"))
-    _field("Complete frames", _fmt(pre.get("frames", {}).get("complete_pct"), 2, "%"))
-    _field("Application goodput", _fmt(pre.get("application_goodput_mbps"), 3, " Mbps"))
-    print("\nMEASURED UDP VIDEO-LIKE TRAFFIC AFTER DECISION")
-    _field("Packet loss", _fmt(post.get("loss_pct"), 3, "%"))
-    _field("P95 process delay", _fmt(post.get("p95_one_way_process_delay_ms"), 2, " ms"))
-    _field("Interarrival jitter", _fmt(post.get("rfc3550_interarrival_jitter_ms"), 2, " ms"))
-    _field("Maximum packet gap", _fmt(post.get("max_interarrival_gap_ms"), 2, " ms"))
-    _field("Complete frames", _fmt(post.get("frames", {}).get("complete_pct"), 2, "%"))
-    _field("Application goodput", _fmt(post.get("application_goodput_mbps"), 3, " Mbps"))
+    _print_traffic_window("BEFORE DECISION", pre)
+    _print_traffic_window("AFTER DECISION", post)
     _field("Traffic/mechanical checks", _color(
         "PASSED" if result.get("pilot_valid") else "FAILED",
         "success" if result.get("pilot_valid") else "critical",
@@ -696,6 +700,8 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
                 "completed_checks": len(result["recording_checks"]),
                 "handover_check": result.get("handover_check"),
                 "pilot_valid": result.get("pilot_valid"),
+                "pre_decision": result["pre_decision"],
+                "post_decision": result["post_decision"],
                 "handover_switch_verified": _handover_switch_verified(result),
                 "stay_wifi_verified": result.get("checks", {}).get("stay_used_only_wifi") is True,
                 "recording_goal_observed": result["recording_demo"]["recording_goal_observed"],
@@ -726,6 +732,8 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
             _field("Final decision made by", "HOSN RULES" if item["source"] == "RULES"
                    else "TRAINED HOSN AI" if item["source"] == "AI" else item["source"])
             _field("AI used in this scenario", _yes_no(item["ai_called_any"]))
+            _print_traffic_window("BEFORE DECISION", item["pre_decision"])
+            _print_traffic_window("AFTER DECISION", item["post_decision"])
             _field("Traffic/mechanical checks", "PASSED" if item["pilot_valid"] else "FAILED")
             _field("Scenario goal observed", _yes_no(item["recording_goal_observed"]))
         print("\nSaved evidence:", parent)
