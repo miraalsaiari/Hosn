@@ -475,16 +475,18 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
             decision_callback=None, observation_callback=None) -> dict:
     """Run the existing replay and, optionally, expose real recording probes.
 
-    The optional callback is used only by the ATP recording demo. It takes one
-    additional observation at the initial position, giving four real probes
-    across the existing three movement stages. The controller is still called
-    once at the original decision position; research replays retain their path.
+    Recording uses one additional observation at the initial position, giving
+    up to four real probes across the existing three movement stages. When both
+    callbacks are supplied, the controller decides after each probe; an early
+    handover ends monitoring because Wi-Fi has been disconnected. Research
+    replays still probe and decide only at the original decision position.
     Extra recording probes share the links with media-like traffic, so their
     measured outcomes should not be treated as identical research replays.
     """
     wifi_if = station.wintfs[0].name
     movement = scenario["movement"]
     decision_stage_index = int(scenario["decision_stage_index"])
+    recording_mode = observation_callback is not None and decision_callback is not None
     if observation_callback is not None and (
         len(movement) != 3 or decision_stage_index != len(movement) - 1
     ):
@@ -551,6 +553,8 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
         }
         previous_rssi = previous_elapsed = None
         recording_checks = []
+        handover_check = None
+        handover_executed = False
         for stage_index, stage in enumerate(movement):
             base.sleep_until(start + stage["at_s"])
             station.position = [stage["x_m"], 40.0, 0.0]
@@ -619,6 +623,8 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                         "cell": "constant emulated cellular profile, not RF measurement",
                     },
                 }
+                if recording_mode or final_observation:
+                    observed["rule_evaluation"] = evaluate_snapshot_rules(observed)
                 if observation_callback is not None:
                     observed["monitor_signal_observed_at_s"] = elapsed
                     observed["monitor_observed_at_s"] = time.monotonic() - start
@@ -635,12 +641,11 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                         "snapshot": observed,
                     })
                     observation_callback(observed, check_number, len(movement) + 1, final_observation)
-                if not final_observation:
+                if not recording_mode and not final_observation:
                     continue
 
                 decision_ns = time.monotonic_ns()
                 snapshot = observed
-                snapshot["rule_evaluation"] = evaluate_snapshot_rules(snapshot)
                 if decision_callback is not None:
                     controller_decision = decision_callback(snapshot)
                     if not isinstance(controller_decision, dict):
@@ -649,6 +654,12 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                     if selected not in (STAY, HANDOVER):
                         raise ValueError("decision_callback action must be STAY or HANDOVER")
                     action = selected
+                if observation_callback is not None:
+                    recording_checks[-1].update(
+                        controller_decision=controller_decision,
+                        action=action,
+                        executed_handover=False,
+                    )
                 if action == HANDOVER:
                     control.write_text("duplicate\n", encoding="utf-8")
                     duplicate_ns = time.monotonic_ns()
@@ -664,6 +675,13 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                     compare.disconnect_wifi(station, ap, run, helper)
                     timing["wifi_break_ns"] = time.monotonic_ns()
                     timing["wifi_disconnected_verified"] = helper.actual_link(station, run)[0] == ""
+                    if observation_callback is not None:
+                        recording_checks[-1]["executed_handover"] = True
+                        handover_check = check_number
+                    handover_executed = True
+                    break
+            if handover_executed:
+                break
 
         if decision_ns is None or snapshot is None:
             raise RuntimeError("decision snapshot was not captured")
@@ -691,6 +709,7 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
         )
         if observation_callback is not None:
             summary["recording_checks"] = recording_checks
+            summary["handover_check"] = handover_check
         compare.write_json(replay_dir / "summary.json", summary)
         return summary
     finally:

@@ -5,10 +5,10 @@ This wrapper reuses the project's accepted measured-data AI, rules-first
 controller, media-like workload, and make-before-break executor.  It runs only
 three presentation scenarios, one at a time, instead of the full 48-replay
 research evaluation.
-Each recording makes four real monitoring observations across the existing
-three movement stages. The first three observations show measurements and the
-active path; the original rules-first controller decides once at the final
-movement stage, calling AI only if the final rules evaluation finds a conflict.
+Each recording plans four real monitoring observations across three movement
+stages. The existing rules-first controller evaluates every actual check and
+calls AI immediately if those rules find a conflict. An authorized handover
+executes immediately; monitoring stops because the Wi-Fi link is disconnected.
 Recording-only extra probes share links with the video-like UDP workload, so
 these run outcomes should not be compared as identical research replays.
 
@@ -33,6 +33,7 @@ same checks as hosn_final_comparison.py.
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import json
 import math
@@ -54,7 +55,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v4"
+REVISION = "atp-recording-three-scenario-v5"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -102,6 +103,19 @@ def _scenario_by_id(identifier: str) -> dict:
     raise RuntimeError("Required evaluation scenario is missing: " + identifier)
 
 
+def _recording_scenario(number: str) -> dict:
+    """Choose real movement inputs without changing the research scenario matrix."""
+    scenario = copy.deepcopy(_scenario_by_id(SCENARIO_SPECS[number]["source_id"]))
+    if number == "1":
+        # Stage 2 stays nearer the AP to demonstrate an ordinary rules STAY;
+        # the original final degradation and handover conditions stay intact.
+        first, middle = scenario["movement"][:2]
+        middle["x_m"] = (first["x_m"] + middle["x_m"]) / 2
+        middle["wifi_profile"] = first["wifi_profile"]
+        scenario["recording_intermediate_position_adjusted"] = True
+    return scenario
+
+
 def _line(char: str = "=", width: int = 78) -> str:
     return char * width
 
@@ -139,6 +153,12 @@ def _yes_no(value: Any) -> str:
     return "YES" if bool(value) else "NO"
 
 
+def _path_label(value: Any) -> str:
+    return {"wifi": "Wi-Fi AP1", "5g": "Emulated cellular/5G-like IP path"}.get(
+        value, str(value) if value is not None else "unavailable"
+    )
+
+
 def _clear_screen() -> None:
     if sys.stdout.isatty():
         print("\033[2J\033[H", end="", flush=True)
@@ -171,22 +191,22 @@ def _print_scenario_intro(number: str, info: dict, model_info: dict) -> None:
             "success" if model_info["accepted"] else "critical",
         ))
     if number == "1":
-        print("\nStarting four real monitoring probes. The original HOSN rules")
-        print("evaluate the final measurements after the user moves away from Wi-Fi.")
+        print("\nStarting up to four real monitoring checks. The original HOSN")
+        print("controller applies its rules after every check.")
     else:
-        print("\nStarting four real monitoring probes. The rules-first controller")
-        print("decides at the final check; a final rules conflict calls the AI.")
+        print("\nStarting up to four real monitoring checks. Rules run after each")
+        print("check; a real conflict calls the trained AI immediately.")
+    print("An authorized handover executes immediately and ends Wi-Fi monitoring.")
     print("Recording probes share the media links; results describe this run.", flush=True)
 
 
 def _print_monitoring_check(snapshot: dict, index: int, total: int,
-                            final_check: bool, previous: dict | None,
-                            rules_only_case: bool = False) -> None:
+                            final_check: bool, previous: dict | None) -> None:
     _section("CHECK {} / {}  |  LIVE NETWORK MONITORING".format(index, total))
     _field("Elapsed traffic time", _fmt(snapshot.get("monitor_observed_at_s"), 2, " s"))
     _field("Signal sampled at", _fmt(snapshot.get("monitor_signal_observed_at_s"), 2, " s"))
     _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
-    _field("Selected sender path", snapshot.get("selected_access_before_decision", "unavailable"))
+    _field("Selected sender path", _path_label(snapshot.get("selected_access_before_decision")))
     print("\nHOSN ACTION\n  Existing Wi-Fi and candidate path probes completed.")
     _field("Wi-Fi / candidate pings", "{} / {}".format(
         snapshot.get("wifi_probe_count", "unavailable"),
@@ -220,21 +240,13 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
                 ))
             else:
                 _field(title, "unavailable for comparison")
-    if final_check:
-        print("\nRULES EVALUATION\n  Evaluating the final measured snapshot now...", flush=True)
-    else:
-        print("\nCONTROLLER STATUS  |  MONITORING ONLY")
-        _field("Selected path", snapshot.get("selected_access_before_decision", "unavailable"))
-        _field("Controller decision", "PENDING CHECK 4")
-        if rules_only_case:
-            print("  HOSN keeps measuring; the rules evaluate the final check.", flush=True)
-        else:
-            print("  HOSN keeps measuring; AI runs only if the final rules conflict.", flush=True)
+    print("\nRULES EVALUATION\n  HOSN is deciding from this check's real measurements...", flush=True)
 
 
-def _print_snapshot(snapshot: dict, decision: dict) -> None:
+def _print_snapshot(snapshot: dict, decision: dict, check: int, total: int) -> None:
     rule = snapshot.get("rule_evaluation", {})
-    _section("RULES EVALUATION", "warning" if rule.get("status") == "CONFLICT" else "info")
+    _section("RULES EVALUATION  |  CHECK {} / {}".format(check, total),
+             "warning" if rule.get("status") == "CONFLICT" else "info")
     _field("Rules status", rule.get("status", "UNKNOWN"))
     _field("Rules result", rule.get("decision", "UNKNOWN"))
     _field("Reason", rule.get("reason", "No reason recorded."))
@@ -255,7 +267,7 @@ def _print_snapshot(snapshot: dict, decision: dict) -> None:
         prediction = controller.get("ai_prediction")
         _field("Actual AI prediction", prediction if prediction is not None
                else "unavailable (model did not return a usable prediction)")
-    _section("FINAL CONTROLLER")
+    _section("CONTROLLER DECISION  |  CHECK {} / {}".format(check, total))
     _field("Rules result", "{} | {}".format(
         rule.get("decision", "UNKNOWN"), rule.get("status", "UNKNOWN")))
     _field("AI called", _yes_no(decision.get("ai_called")))
@@ -271,7 +283,9 @@ def _print_snapshot(snapshot: dict, decision: dict) -> None:
         print("  The executor will duplicate traffic, verify candidate packets,")
         print("  select the 5G-like path, and then disconnect Wi-Fi.", flush=True)
     else:
-        print("  Current Wi-Fi path remains selected; video-like traffic continues.", flush=True)
+        print("  HOSN chose STAY. Wi-Fi remains selected; video-like traffic continues.")
+        print("  Monitoring continues to the next check." if check < total else
+              "  All planned checks are complete; no handover was authorized.", flush=True)
 
 
 def _handover_switch_verified(result: dict) -> bool:
@@ -293,7 +307,20 @@ def _print_result(result: dict, expected_action: str | None = None,
     post = result["post_decision"]
     decision = result["controller_decision"]
     timing = result.get("timing", {})
+    history = result.get("recording_checks", ())
+    ai_called_any = any(bool(item.get("controller_decision", {}).get("ai_called"))
+                        for item in history)
     switch_verified = _handover_switch_verified(result)
+    _section("HOSN DECISIONS ACROSS THE MONITORING CHECKS")
+    for item in history:
+        check_decision = item.get("controller_decision") or {}
+        _field("Check {} / 4".format(item["number"]),
+               "{} via {} | AI called {}".format(
+                   check_decision.get("action", "UNKNOWN"),
+                   check_decision.get("source", "UNKNOWN"),
+                   _yes_no(check_decision.get("ai_called"))))
+    _field("AI used in this scenario", _yes_no(ai_called_any))
+    _field("Last decision source", decision.get("source", "UNKNOWN"))
     _section("POST-HANDOVER VERIFICATION" if result["action"] == paired.HANDOVER
              else "POST-DECISION VERIFICATION",
              "success" if result.get("pilot_valid") and
@@ -301,6 +328,8 @@ def _print_result(result: dict, expected_action: str | None = None,
     _field("Executed action", result["action"])
     _field("Decision source", decision.get("source", "UNKNOWN"))
     if result["action"] == paired.HANDOVER:
+        _field("Handover triggered at", "Check {} / 4".format(result["handover_check"])
+               if result.get("handover_check") is not None else "UNAVAILABLE")
         _field("Wi-Fi AP1 -> emulated 5G", _color(
             "SWITCH VERIFIED" if switch_verified else "SWITCH NOT VERIFIED",
             "success" if switch_verified else "critical"))
@@ -327,12 +356,27 @@ def _print_result(result: dict, expected_action: str | None = None,
         "success" if result.get("pilot_valid") else "critical",
     ))
     if expected_action is not None:
-        _field("Recording goal", "{} via {}".format(expected_action, expected_source))
-        _field("Observed decision", "{} via {}".format(
+        goal_source = ("an AI decision during monitoring" if expected_source == "AI"
+                       else "rules only" if expected_source == "RULES"
+                       else str(expected_source))
+        _field("Recording goal", "{} with {}".format(expected_action, goal_source))
+        _field("Final decision", "{} via {}".format(
             result["action"], decision.get("source", "UNKNOWN")))
     action_met = expected_action is None or result["action"] == expected_action
-    source_met = expected_source is None or decision.get("source") == expected_source
-    ai_met = expected_source is None or bool(decision.get("ai_called")) == (expected_source == "AI")
+    if expected_source == "AI":
+        source_met = any(
+            (item.get("controller_decision") or {}).get("source") == "AI" and
+            (item.get("controller_decision") or {}).get("action") == expected_action
+            for item in history
+        )
+    elif expected_source == "RULES":
+        source_met = decision.get("source") == "RULES" and all(
+            (item.get("controller_decision") or {}).get("source") == "RULES"
+            for item in history
+        )
+    else:
+        source_met = expected_source is None or decision.get("source") == expected_source
+    ai_met = expected_source is None or ai_called_any == (expected_source == "AI")
     goal_met = action_met and source_met and ai_met
     succeeded = bool(result.get("pilot_valid")) and goal_met and (
         result["action"] != paired.HANDOVER or switch_verified
@@ -444,7 +488,7 @@ def _setup_network(run_folder: Path):
 def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: Path,
                       countdown_seconds: int, hold_seconds: float) -> dict:
     info = SCENARIO_SPECS[number]
-    scenario = _scenario_by_id(info["source_id"])
+    scenario = _recording_scenario(number)
     run_folder = parent / ("scenario_" + number)
     run_folder.mkdir(parents=True, exist_ok=False)
     old_cwd = Path.cwd()
@@ -465,14 +509,16 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
                                  final_check: bool) -> None:
             nonlocal previous_observation
             _print_monitoring_check(snapshot, check, total, final_check,
-                                    previous_observation, rules_only_case=number == "1")
+                                    previous_observation)
             previous_observation = snapshot
 
         def decision_callback(snapshot: dict) -> dict:
+            check = len(callback_state.setdefault("history", [])) + 1
             decision = final.decide(router.HOSN_FULL_AI, snapshot, model)
             callback_state["snapshot"] = snapshot
             callback_state["decision"] = decision
-            _print_snapshot(snapshot, decision)
+            callback_state["history"].append(decision)
+            _print_snapshot(snapshot, decision, check, 4)
             return decision
 
         result = paired.run_one(
@@ -491,8 +537,11 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
         )
         if "snapshot" not in callback_state:
             raise RuntimeError("The decision callback was never reached.")
-        if len(result.get("recording_checks", ())) != 4:
-            raise RuntimeError("The recording did not collect four real monitoring checks.")
+        check_count = len(result.get("recording_checks", ()))
+        if not 1 <= check_count <= 4 or check_count != len(callback_state["history"]):
+            raise RuntimeError("Every recording check must have one real controller decision.")
+        if check_count < 4 and result.get("handover_check") != check_count:
+            raise RuntimeError("Wi-Fi monitoring ended without an executed early handover.")
         goal_observed = _print_result(
             result, scenario["expected_action_for_evaluation_only"], info["expected_source"]
         )
@@ -504,6 +553,9 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
             "fixed_three_check_gate_used": False,
             "real_monitoring_checks": len(result["recording_checks"]),
             "additional_probe_at_initial_position": True,
+            "recording_intermediate_position_adjusted": scenario.get(
+                "recording_intermediate_position_adjusted", False),
+            "handover_check": result.get("handover_check"),
             "recording_goal_observed": goal_observed,
             "recording_probes_share_media_links": True,
         }
@@ -536,9 +588,10 @@ def _plan() -> None:
         print("   Movement: {} | speed: {} | decision zone: {}".format(
             source["direction"], source["speed_class"], source["decision_zone"]
         ))
-    print("\nThe final HOSN controller receives no evaluation answer as an input.")
-    print("Four recording checks use real probes; only the final check decides.")
-    print("Checks 1-3 show measurements and the selected path; only Check 4 decides.")
+    print("\nThe HOSN controller receives no evaluation answer as an input.")
+    print("Up to four checks use real probes and an actual HOSN decision at each check.")
+    print("AI runs immediately on a real rules conflict; handover executes when authorized.")
+    print("An early handover ends Wi-Fi monitoring before Check 4.")
     print("The old synthetic hosn_ai_model.pkl is never loaded.")
     print(_line())
 
@@ -575,6 +628,10 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
                 "action": result["action"],
                 "source": result["controller_decision"].get("source"),
                 "ai_called": result["controller_decision"].get("ai_called"),
+                "ai_called_any": any(bool(item.get("controller_decision", {}).get("ai_called"))
+                                     for item in result["recording_checks"]),
+                "completed_checks": len(result["recording_checks"]),
+                "handover_check": result.get("handover_check"),
                 "pilot_valid": result.get("pilot_valid"),
                 "handover_switch_verified": _handover_switch_verified(result),
                 "stay_wifi_verified": result.get("checks", {}).get("stay_used_only_wifi") is True,
@@ -590,7 +647,10 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
         for item in manifest["scenarios"]:
             _section("SCENARIO {} | FINAL RESULT".format(item["number"]),
                      "success" if item["recording_goal_observed"] else "critical")
+            _field("Checks completed", "{} / 4".format(item["completed_checks"]))
             if item["action"] == paired.HANDOVER:
+                _field("Handover executed at", "CHECK {}".format(item["handover_check"])
+                       if item["handover_check"] is not None else "UNCONFIRMED")
                 _field("Wi-Fi AP1 -> emulated 5G", "SWITCH VERIFIED" if
                        item["handover_switch_verified"] else "SWITCH NOT VERIFIED")
                 _field("Selected traffic path", "Emulated cellular/5G-like IP path" if
@@ -599,8 +659,10 @@ def run_selected(root: Path, selection: str, countdown_seconds: int,
                 _field("Handover", "NO - controller chose STAY")
                 _field("Selected traffic path", "Wi-Fi AP1" if
                        item["stay_wifi_verified"] else "UNCONFIRMED")
-            _field("Controller decision", "{} via {}".format(item["action"], item["source"]))
-            _field("AI called", _yes_no(item["ai_called"]))
+            _field("Controller decision", item["action"])
+            _field("Final decision made by", "HOSN RULES" if item["source"] == "RULES"
+                   else "TRAINED HOSN AI" if item["source"] == "AI" else item["source"])
+            _field("AI used in this scenario", _yes_no(item["ai_called_any"]))
             _field("Traffic/mechanical checks", "PASSED" if item["pilot_valid"] else "FAILED")
             _field("Scenario goal observed", _yes_no(item["recording_goal_observed"]))
         print("\nSaved evidence:", parent)
