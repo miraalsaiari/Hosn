@@ -628,10 +628,6 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
                     observed["selected_access_before_decision"] = control.read_text(
                         encoding="utf-8"
                     ).strip()
-                    if not final_observation:
-                        # A read-only rules diagnostic, never an authorization
-                        # or an additional call to the controller or AI.
-                        observed["monitoring_rules_preview"] = evaluate_snapshot_rules(observed)
                     recording_checks.append({
                         "number": check_number, "final": final_observation,
                         "stage_index": stage_index,

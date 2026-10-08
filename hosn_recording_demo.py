@@ -6,8 +6,9 @@ controller, media-like workload, and make-before-break executor.  It runs only
 three presentation scenarios, one at a time, instead of the full 48-replay
 research evaluation.
 Each recording makes four real monitoring observations across the existing
-three movement stages. Early rules diagnostics do not authorize an action;
-the original controller still decides once at the final movement stage.
+three movement stages. The first three observations show measurements and the
+active path; the original rules-first controller decides once at the final
+movement stage, calling AI only if the final rules evaluation finds a conflict.
 Recording-only extra probes share links with the video-like UDP workload, so
 these run outcomes should not be compared as identical research replays.
 
@@ -53,7 +54,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v2"
+REVISION = "atp-recording-three-scenario-v3"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -164,18 +165,45 @@ def _print_scenario_intro(number: str, info: dict, model_info: dict) -> None:
     print("\nINITIALIZING HOSN")
     _field("Topology interfaces", _color("VERIFIED", "success"))
     _field("Existing controller", _color("READY", "success"))
-    _field("Accepted measured-data AI", _color(
-        "LOADED" if model_info["accepted"] else "UNAVAILABLE",
-        "success" if model_info["accepted"] else "critical",
-    ))
-    print("\nStarting four real monitoring probes. Rules and AI make the final")
-    print("controller decision at the existing decision position.")
+    if number != "1":
+        _field("Accepted measured-data AI", _color(
+            "LOADED" if model_info["accepted"] else "UNAVAILABLE",
+            "success" if model_info["accepted"] else "critical",
+        ))
+    print("\nStarting four real monitoring probes. The rules-first controller")
+    print("decides at the final check; a final rules conflict calls the AI.")
     print("Recording probes share the media links; results describe this run.", flush=True)
 
 
 def _print_monitoring_check(snapshot: dict, index: int, total: int,
-                            final_check: bool, previous: dict | None) -> None:
+                            final_check: bool, previous: dict | None,
+                            concise: bool = False) -> None:
     _section("CHECK {} / {}  |  LIVE NETWORK MONITORING".format(index, total))
+    if concise:
+        _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
+        _field("Wi-Fi / candidate pings", "{} / {}".format(
+            snapshot.get("wifi_probe_count", "unavailable"),
+            snapshot.get("cell_probe_count", "unavailable")))
+        _field("Wi-Fi AP1 modeled RSSI", _fmt(snapshot.get("wifi_rssi_model_dbm"), 2, " dBm"))
+        _field("Wi-Fi measured RTT", _fmt(snapshot.get("wifi_rtt_ms"), 2, " ms"))
+        _field("Wi-Fi measured loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
+        _field("Wi-Fi modeled trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
+        _field("Candidate configured signal", _fmt(
+            snapshot.get("cell_rsrp_configured_dbm"), 2, " dBm"))
+        _field("Candidate configured trend", _fmt(
+            snapshot.get("cell_trend_db_per_s"), 3, " dB/s"))
+        _field("Candidate measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
+        _field("Candidate measured loss", _fmt(snapshot.get("cell_loss_pct"), 2, "%"))
+        if previous is not None:
+            before, after = previous.get("wifi_rssi_model_dbm"), snapshot.get("wifi_rssi_model_dbm")
+            if _finite_number(before) and _finite_number(after):
+                _field("Wi-Fi signal change", _fmt(after - before, 2, " dB"))
+        _field("Selected sender path", snapshot.get("selected_access_before_decision", "unavailable"))
+        if final_check:
+            print("\nRules evaluating the final measurements now...", flush=True)
+        else:
+            print("\nMonitoring continues. No controller decision has been made yet.", flush=True)
+        return
     _field("Elapsed traffic time", _fmt(snapshot.get("monitor_observed_at_s"), 2, " s"))
     _field("Signal sampled at", _fmt(snapshot.get("monitor_signal_observed_at_s"), 2, " s"))
     _field("Emulated station X", _fmt(snapshot.get("emulated_station_x_m"), 1, " m"))
@@ -216,13 +244,8 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     if final_check:
         print("\nRULES EVALUATION\n  Evaluating the final measured snapshot now...", flush=True)
     else:
-        preview = snapshot.get("monitoring_rules_preview") or {}
-        print("\nRULES DIAGNOSTIC  |  MONITORING ONLY")
-        _field("Rules result", "{} | {}".format(
-            preview.get("decision", "unavailable"), preview.get("status", "unavailable")))
-        _field("Rules reason", preview.get("reason", "unavailable"))
-        print("  This is not a controller decision; AI and action are pending.")
-        print("  The selected sender path remains Wi-Fi; monitoring continues...", flush=True)
+        print("\nThe selected sender path remains Wi-Fi. Monitoring continues;")
+        print("rules run at Check 4, and AI runs only if those rules conflict.", flush=True)
 
 
 def _print_snapshot(snapshot: dict, decision: dict) -> None:
@@ -428,7 +451,7 @@ def _run_one_scenario(root: Path, number: str, model, model_info: dict, parent: 
                                  final_check: bool) -> None:
             nonlocal previous_observation
             _print_monitoring_check(snapshot, check, total, final_check,
-                                    previous_observation)
+                                    previous_observation, concise=number == "1")
             previous_observation = snapshot
 
         def decision_callback(snapshot: dict) -> dict:
@@ -501,7 +524,7 @@ def _plan() -> None:
         ))
     print("\nThe final HOSN controller receives no evaluation answer as an input.")
     print("Four recording checks use real probes; only the final check decides.")
-    print("Checks 1-3 show read-only rule diagnostics, never controller STAY votes.")
+    print("Checks 1-3 show measurements and the selected path; only Check 4 decides.")
     print("The old synthetic hosn_ai_model.pkl is never loaded.")
     print(_line())
 
