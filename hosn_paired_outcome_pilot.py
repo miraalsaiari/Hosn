@@ -249,9 +249,74 @@ def evaluate_snapshot_rules(snapshot: dict) -> dict:
     }
 
 
+def _summarize_pre_decision(unique: list[dict], decision_sequence: int) -> dict:
+    """Describe packets scheduled before the decision using actual receiver events.
+
+    A sender sequence determines the window, even if the packet reaches the
+    receiver later. The frame touching the decision boundary is excluded from
+    frame completeness, while its packets still count toward loss and goodput.
+    """
+    pre = [event for event in unique if 0 <= event["sequence"] < decision_sequence]
+    expected = decision_sequence
+    received = len(pre)
+    lost = max(0, expected - received)
+    delays = [
+        (event["received_monotonic_ns"] - event["sent_monotonic_ns"]) / 1e6
+        for event in pre
+    ]
+    gaps = [
+        (right["received_monotonic_ns"] - left["received_monotonic_ns"]) / 1e6
+        for left, right in zip(pre, pre[1:])
+    ]
+    # Only complete frame intervals wholly sent before the decision belong in
+    # the before-frame denominator; the boundary frame belongs to neither side.
+    full_frames = decision_sequence // compare.PACKETS_PER_FRAME
+    frame_parts = {frame: set() for frame in range(full_frames)}
+    for event in pre:
+        if event["frame"] in frame_parts:
+            frame_parts[event["frame"]].add(event["part"])
+    complete_flags = [
+        len(frame_parts[frame]) == compare.PACKETS_PER_FRAME
+        for frame in range(full_frames)
+    ]
+    damaged = sum(0 < len(parts) < compare.PACKETS_PER_FRAME for parts in frame_parts.values())
+    missing = sum(not parts for parts in frame_parts.values())
+    longest = run = 0
+    for complete in complete_flags:
+        run = 0 if complete else run + 1
+        longest = max(longest, run)
+    duration = expected / compare.PACKETS_PER_SECOND if expected else 0.0
+    return {
+        "expected_packets": expected,
+        "received_packets": received,
+        "lost_packets": lost,
+        "loss_pct": 100.0 * lost / expected if expected else None,
+        "p95_one_way_process_delay_ms": _percentile(delays, 0.95),
+        "rfc3550_interarrival_jitter_ms": compare.rfc3550_jitter_ms(pre),
+        "max_interarrival_gap_ms": max(gaps) if gaps else None,
+        "gaps_over_150ms": sum(gap > 150.0 for gap in gaps),
+        "application_goodput_mbps": (
+            received * compare.PAYLOAD_BYTES * 8 / duration / 1e6 if duration else None
+        ),
+        "frames": {
+            "expected": len(complete_flags),
+            "complete": sum(complete_flags),
+            "damaged": damaged,
+            "missing": missing,
+            "complete_pct": (
+                100.0 * sum(complete_flags) / len(complete_flags)
+                if complete_flags else None
+            ),
+            "longest_incomplete_run_frames": longest,
+            "longest_incomplete_run_ms": 1000.0 * longest / compare.FRAME_RATE,
+        },
+    }
+
+
 def summarize_outcome(sender: dict, receiver: dict, events: list[dict],
                       action: str, start_ns: int, decision_ns: int,
-                      timing: dict, duration_s: float = TRAFFIC_DURATION_S) -> dict:
+                      timing: dict, duration_s: float = TRAFFIC_DURATION_S,
+                      include_pre_decision: bool = False) -> dict:
     """Summarize raw observations without hiding duplicates or loss."""
     if action not in (STAY, HANDOVER):
         raise ValueError("Unknown action")
@@ -324,7 +389,7 @@ def summarize_outcome(sender: dict, receiver: dict, events: list[dict],
         "wifi_disconnect_verified": action != HANDOVER or timing["wifi_disconnected_verified"],
     }
     boolean_checks = [value for value in action_checks.values() if isinstance(value, bool)]
-    return {
+    summary = {
         "action": action,
         "attempted_packets": attempted,
         "raw_datagrams_received": len(ordered),
@@ -362,6 +427,9 @@ def summarize_outcome(sender: dict, receiver: dict, events: list[dict],
         "checks": action_checks,
         "pilot_valid": all(boolean_checks),
     }
+    if include_pre_decision:
+        summary["pre_decision"] = _summarize_pre_decision(unique, decision_sequence)
+    return summary
 
 
 def aggregate_by_action(results: dict[str, dict]) -> dict[str, dict]:
@@ -721,6 +789,7 @@ def run_one(action: str, scenario: dict, replay_dir: Path, station, server,
         summary = summarize_outcome(
             sender_data, receiver_data, events, action, start_ns, decision_ns,
             timing, duration_s,
+            include_pre_decision=observation_callback is not None,
         )
         summary.update(
             scenario_id=scenario["id"],
@@ -1132,6 +1201,59 @@ def run_self_tests() -> int:
             self.assertEqual(summary["duplicate_datagrams_received"], 0)
             self.assertEqual(summary["post_decision"]["frames"]["complete_pct"], 100.0)
             self.assertTrue(summary["pilot_valid"])
+
+        def test_recording_before_after_use_disjoint_sent_sequences(self):
+            # A small packet-arrival fixture: sequence 1 is lost, sequence 0
+            # is duplicated, and decision_sequence 6 bisects frame 1.
+            start_ns = 1_000_000_000
+            events = []
+            for sequence in range(16):
+                if sequence == 1:
+                    continue
+                sent_ns = start_ns + sequence * 10_000_000
+                event = {
+                    "sequence": sequence,
+                    "sent_monotonic_ns": sent_ns,
+                    "received_monotonic_ns": sent_ns + 2_000_000,
+                    "declared_path": "wifi", "source_ip": base.WIFI_UE_IP,
+                    "frame": sequence // compare.PACKETS_PER_FRAME,
+                    "part": sequence % compare.PACKETS_PER_FRAME,
+                    "payload_bytes": compare.PAYLOAD_BYTES,
+                }
+                events.append(event)
+                if sequence == 0:
+                    events.append(dict(event, received_monotonic_ns=sent_ns + 3_000_000))
+            sender = {"status": "complete", "scheduled_sequences": 16}
+            receiver = {"status": "complete", "parse_errors": 0}
+            timing = {"duplicate_start_ns": None, "candidate_verified_ns": None,
+                      "wifi_break_ns": None, "wifi_disconnected_verified": False}
+            arguments = (sender, receiver, events, STAY, start_ns,
+                         start_ns + 60_000_000, timing)
+            recording = summarize_outcome(*arguments, include_pre_decision=True)
+            research = summarize_outcome(*arguments)
+            before, after = recording["pre_decision"], recording["post_decision"]
+            self.assertEqual(recording["decision_sequence"], 6)
+            self.assertEqual(recording["duplicate_datagrams_received"], 1)
+            self.assertEqual((before["expected_packets"], before["received_packets"]), (6, 5))
+            self.assertAlmostEqual(before["loss_pct"], 100.0 / 6)
+            self.assertEqual((after["expected_packets"], after["received_packets"]), (10, 10))
+            self.assertEqual(after["loss_pct"], 0.0)
+            self.assertEqual((before["frames"]["expected"], before["frames"]["damaged"]), (1, 1))
+            self.assertEqual(before["frames"]["complete_pct"], 0.0)
+            self.assertEqual((after["frames"]["expected"], after["frames"]["complete_pct"]), (2, 100.0))
+            self.assertGreater(before["max_interarrival_gap_ms"], 10.0)
+            self.assertEqual(before["rfc3550_interarrival_jitter_ms"], 0.0)
+            self.assertNotIn("pre_decision", research)
+            self.assertEqual(recording["post_decision"], research["post_decision"])
+
+        def test_recording_empty_before_window_is_unavailable(self):
+            pre = _summarize_pre_decision([], decision_sequence=0)
+            self.assertEqual((pre["expected_packets"], pre["received_packets"]), (0, 0))
+            self.assertIsNone(pre["loss_pct"])
+            self.assertIsNone(pre["application_goodput_mbps"])
+            self.assertIsNone(pre["frames"]["complete_pct"])
+            self.assertIsNone(pre["rfc3550_interarrival_jitter_ms"])
+            self.assertIsNone(pre["max_interarrival_gap_ms"])
 
         def test_handover_summary_counts_duplicates(self):
             events = []
