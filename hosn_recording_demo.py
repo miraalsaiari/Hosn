@@ -55,7 +55,7 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v8"
+REVISION = "atp-recording-three-scenario-v9"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
@@ -257,9 +257,7 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     _field("Measured packet loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
     _field("Modeled signal trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
     print("\nCANDIDATE NETWORK  |  Emulated cellular/5G-like IP path")
-    _field("Configured path condition", _candidate_condition(
-        snapshot.get("cell_profile_active")))
-    _field("Signal strength reference", _fmt(
+    _field("Signal strength", _fmt(
         snapshot.get("cell_rsrp_configured_dbm"), 2,
         " dBm (fixed configuration; no 5G RF reading)"))
     _field("Measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
@@ -284,11 +282,6 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
                 ))
             else:
                 _field(title, "unavailable for comparison")
-        before_profile, after_profile = (previous.get("cell_profile_active"),
-                                         snapshot.get("cell_profile_active"))
-        if before_profile != after_profile:
-            _field("Candidate test condition", "{} -> {}".format(
-                _candidate_condition(before_profile), _candidate_condition(after_profile)))
     print("\nRULES EVALUATION\n  HOSN is deciding from this check's real measurements...", flush=True)
 
 
