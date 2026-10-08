@@ -55,11 +55,18 @@ import hosn_wifi_5g_compare as compare
 import hosn_wifi_5g_pilot as base
 
 
-REVISION = "atp-recording-three-scenario-v6"
+REVISION = "atp-recording-three-scenario-v7"
 COLOR_MODE = "auto"
 COLORS = {
     "info": "\033[94m", "success": "\033[92m", "warning": "\033[93m",
     "ai": "\033[95m", "critical": "\033[91m",
+}
+PROFILE_LABELS = {
+    "emulated_5g_congested": "CONGESTED",
+    "cell_eval_poor": "POOR",
+    "cell_eval_fair": "FAIR",
+    "cell_eval_good": "GOOD",
+    "emulated_5g_healthy": "HEALTHY",
 }
 
 SCENARIO_SPECS = {
@@ -129,6 +136,13 @@ def _recording_scenario(number: str) -> dict:
         final["cell_profile"] = final_cell_profile
         scenario["recording_candidate_qos_varies"] = True
     return scenario
+
+
+def _candidate_condition(profile: str | None) -> str:
+    """Describe a configured emulation profile without renaming its stored ID."""
+    if profile is None:
+        return "unavailable"
+    return PROFILE_LABELS.get(profile, profile)
 
 
 def _line(char: str = "=", width: int = 78) -> str:
@@ -216,7 +230,7 @@ def _print_scenario_intro(number: str, info: dict, model_info: dict,
         print("\nStarting up to four real monitoring checks. Rules run after each")
         print("check; a real conflict calls the trained AI immediately.")
     if scenario.get("recording_candidate_qos_varies"):
-        print("The candidate's emulated service profile changes during movement;")
+        print("The candidate's configured test condition changes during movement;")
         print("its RTT and packet loss below are measured afresh at every check.")
     print("An authorized handover executes immediately and ends Wi-Fi monitoring.")
     print("Recording probes share the media links; results describe this run.", flush=True)
@@ -240,7 +254,8 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
     _field("Measured packet loss", _fmt(snapshot.get("wifi_loss_pct"), 2, "%"))
     _field("Modeled signal trend", _fmt(snapshot.get("wifi_trend_db_per_s"), 3, " dB/s"))
     print("\nCANDIDATE NETWORK  |  Emulated cellular/5G-like IP path")
-    _field("Emulated service profile", snapshot.get("cell_profile_active", "unavailable"))
+    _field("Configured path condition", _candidate_condition(
+        snapshot.get("cell_profile_active")))
     _field("Measured RTT", _fmt(snapshot.get("cell_rtt_ms"), 2, " ms"))
     _field("Measured packet loss", _fmt(snapshot.get("cell_loss_pct"), 2, "%"))
     print("\nWHAT CHANGED")
@@ -266,8 +281,8 @@ def _print_monitoring_check(snapshot: dict, index: int, total: int,
         before_profile, after_profile = (previous.get("cell_profile_active"),
                                          snapshot.get("cell_profile_active"))
         if before_profile != after_profile:
-            _field("Candidate emulated profile", "{} -> {}".format(
-                before_profile or "unavailable", after_profile or "unavailable"))
+            _field("Candidate test condition", "{} -> {}".format(
+                _candidate_condition(before_profile), _candidate_condition(after_profile)))
     print("\nRULES EVALUATION\n  HOSN is deciding from this check's real measurements...", flush=True)
 
 
@@ -624,8 +639,8 @@ def _plan() -> None:
             _fmt(stage["x_m"], 1) for stage in recording["movement"]
         ))
         if recording.get("recording_candidate_qos_varies"):
-            print("   Candidate service profiles: " + " -> ".join(
-                stage.get("cell_profile", recording["cell_profile"])
+            print("   Candidate test conditions: " + " -> ".join(
+                _candidate_condition(stage.get("cell_profile", recording["cell_profile"]))
                 for stage in recording["movement"]
             ))
     print("\nThe HOSN controller receives no evaluation answer as an input.")
